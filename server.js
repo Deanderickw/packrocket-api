@@ -193,7 +193,7 @@ app.post('/api/signup', async (req, res) => {
       mode: 'subscription',
       customer: customer.id,
       line_items: [{ price: PRICE_IDS[plan] || PRICE_IDS.Starter, quantity: 1 }],
-      success_url: `${process.env.PUBLIC_URL || 'http://localhost:5050'}/dashboard?ok=1`,
+      success_url: `${process.env.PUBLIC_URL || 'https://fortuitous-book-118427.framer.app'}/dashboard?ok=1`,
       cancel_url: `${process.env.PUBLIC_URL || 'http://localhost:5050'}/signup?canceled=1`,
     });
 
