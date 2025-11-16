@@ -18,6 +18,24 @@ const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 )
+// --- Helper to compute profile completion (0–100%) ---
+function computeProfileCompletion(profile) {
+  if (!profile) return 0
+
+  const fields = [
+    profile.full_name,
+    profile.business_name,
+    profile.phone_e164,
+    profile.city,
+    profile.state,
+    profile.logo_url,
+  ]
+
+  const filled = fields.filter((v) => v && String(v).trim() !== "").length
+  const total = fields.length || 1
+
+  return Math.round((filled / total) * 100)
+}
 
 // --- Helper to format dates nicely for the dashboard ---
 function formatDateLabel(isoOrMillis) {
@@ -38,24 +56,27 @@ function formatDateLabel(isoOrMillis) {
 }
 
 // --- Map Supabase 'profiles' row into the Mover shape your Framer component expects ---
+// --- Map Supabase 'profiles' row into the Mover shape your Framer component expects ---
 function mapProfileToMover(profileRow) {
   if (!profileRow) return {}
 
   return {
     id: profileRow.id,
-    name: profileRow.full_name || profileRow.business_name || 'Mover',
-    email: profileRow.email || '',
-    phone: profileRow.phone_e164 || '',
-    // city/state/logo/etc can later come from Airtable if you want
-    city: '',
-    state: '',
-    verified: true,
+    name: profileRow.full_name || profileRow.business_name || "Mover",
+    email: profileRow.email || "",
+    phone: profileRow.phone_e164 || "",
+    city: profileRow.city || "",
+    state: profileRow.state || "",
+    logo: profileRow.logo_url || "",
+    verified: true, // you can change this later
     rating: 4.9,
     jobsCompleted: 0,
     startingPrice: undefined,
     features: [],
+    profileCompletion: computeProfileCompletion(profileRow),
   }
 }
+
 
 const airtable = new Airtable({ apiKey: process.env.AIRTABLE_API_KEY }).base(
   process.env.AIRTABLE_BASE_ID || ''
@@ -209,6 +230,93 @@ app.get('/api/mover-dashboard', async (req, res) => {
   } catch (err) {
     console.error('mover-dashboard route error:', err)
     return res.status(500).json({ ok: false, error: 'Server error' })
+  }
+})
+app.post("/api/update-profile", async (req, res) => {
+  try {
+    const {
+      email,          // required to know which profile
+      full_name,
+      business_name,
+      phone_e164,
+      city,
+      state,
+      logo_url,
+    } = req.body
+
+    if (!email) {
+      return res.status(400).json({ ok: false, error: "Missing email" })
+    }
+
+    const updates = {
+      full_name,
+      business_name,
+      phone_e164,
+      city,
+      state,
+      logo_url,
+      updated_at: new Date().toISOString(),
+    }
+
+    // remove undefined so we don't overwrite with null
+    Object.keys(updates).forEach((k) => {
+      if (updates[k] === undefined) delete updates[k]
+    })
+
+    const { data, error } = await supabase
+      .from("profiles")
+      .update(updates)
+      .eq("email", email)
+      .select("*")
+      .single()
+
+    if (error || !data) {
+      console.error("update-profile supabase error:", error)
+      return res
+        .status(500)
+        .json({ ok: false, error: "Failed to update profile" })
+    }
+
+    // Optional: sync logo to Airtable if you want
+    if (
+      process.env.AIRTABLE_API_KEY &&
+      process.env.AIRTABLE_BASE_ID &&
+      process.env.AIRTABLE_TABLE_NAME &&
+      logo_url
+    ) {
+      try {
+        const records = await moversTable()
+          .select({
+            filterByFormula: `{Email} = "${email}"`,
+            maxRecords: 1,
+          })
+          .firstPage()
+
+        if (records.length > 0) {
+          await moversTable().update([
+            {
+              id: records[0].id,
+              fields: {
+                Logo: [{ url: logo_url }],
+              },
+            },
+          ])
+        }
+      } catch (e) {
+        console.error("Airtable logo sync failed:", e)
+      }
+    }
+
+    const mover = mapProfileToMover(data)
+
+    res.json({
+      ok: true,
+      mover,
+      profileCompletion: mover.profileCompletion,
+    })
+  } catch (err) {
+    console.error("update-profile route error:", err)
+    res.status(500).json({ ok: false, error: "Server error" })
   }
 })
 
