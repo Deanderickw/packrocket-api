@@ -18,6 +18,42 @@ const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
+// --- Helper to format dates nicely for the dashboard ---
+function formatDateLabel(isoOrMillis) {
+  if (!isoOrMillis) return "N/A"
+
+  let date
+  if (typeof isoOrMillis === "number") {
+    date = new Date(isoOrMillis * 1000) // if it's a Unix timestamp in seconds
+  } else {
+    date = new Date(isoOrMillis)
+  }
+
+  if (isNaN(date.getTime())) return "N/A"
+
+  const options = { month: "short", day: "numeric", year: "numeric" }
+  return date.toLocaleDateString("en-US", options) // e.g. "Nov 30, 2025"
+}
+
+// --- Map Supabase 'profiles' row into the Mover shape your Framer component expects ---
+function mapProfileToMover(profileRow) {
+  if (!profileRow) return {}
+
+  return {
+    id: profileRow.id,
+    name: profileRow.full_name || profileRow.business_name || "Mover",
+    email: profileRow.email || "",
+    phone: profileRow.phone_e164 || "",
+    // city/state/logo/etc will eventually come from Airtable
+    city: "",
+    state: "",
+    verified: true, // you can change this later
+    rating: 4.9,
+    jobsCompleted: 0,
+    startingPrice: undefined,
+    features: [],
+  }
+}
 
 const airtable = new Airtable({ apiKey: process.env.AIRTABLE_API_KEY }).base(
   process.env.AIRTABLE_BASE_ID || ''
@@ -46,6 +82,48 @@ app.post(
   async (req, res) => {
     const sig = req.headers['stripe-signature'];
     let event;
+// GET /api/mover-dashboard?email=dean@example.com
+app.get("/api/mover-dashboard", async (req, res) => {
+  try {
+    const email = req.query.email
+
+    if (!email) {
+      return res.status(400).json({ ok: false, error: "Missing email" })
+    }
+
+    // Get the mover profile from Supabase 'profiles' table
+    const { data: profile, error } = await supabase
+      .from("profiles")            // ⬅️ IMPORTANT: table name is 'profiles'
+      .select("*")
+      .eq("email", email)
+      .single()
+
+    if (error) {
+      console.error("Supabase profile error:", error)
+      return res.status(500).json({ ok: false, error: "Profile lookup failed" })
+    }
+
+    if (!profile) {
+      return res.status(404).json({ ok: false, error: "Profile not found" })
+    }
+
+    const mover = mapProfileToMover(profile)
+
+    // Plan + next payment date from your columns
+    const subscriptionTier = profile.plan || "Starter"
+    const nextPaymentDate = formatDateLabel(profile.current_period_end)
+
+    return res.json({
+      ok: true,
+      mover,
+      subscriptionTier,
+      nextPaymentDate,
+    })
+  } catch (err) {
+    console.error("mover-dashboard route error:", err)
+    return res.status(500).json({ ok: false, error: "Server error" })
+  }
+})
 
     try {
       event = stripe.webhooks.constructEvent(
@@ -144,6 +222,110 @@ app.post('/api/signup', async (req, res) => {
     if (!email || !password) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
+app.get("/api/dashboard-profile", async (req, res) => {
+  try {
+    const { session_id } = req.query
+    if (!session_id) {
+      return res.status(400).json({ error: "Missing session_id" })
+    }
+
+    // Get Stripe checkout session
+    const session = await stripe.checkout.sessions.retrieve(session_id, {
+      expand: ["customer"],
+    })
+
+    const email =
+      session.customer_details?.email ||
+      (session.customer && session.customer.email)
+
+    if (!email) {
+      return res.status(404).json({ error: "No email on session" })
+    }
+
+    // Look up mover profile in Supabase by email
+    const { data, error } = await supabase
+      .from("movers") // change to your actual table name if different
+      .select("*")
+      .eq("email", email)
+      .single()
+
+    if (error || !data) {
+      return res.status(404).json({ error: "Profile not found" })
+    }
+
+    // Optional: compute next payment date from subscription
+    let nextPaymentDate = null
+    if (session.subscription) {
+      const subscription = await stripe.subscriptions.retrieve(
+        session.subscription
+      )
+      if (subscription.current_period_end) {
+        const d = new Date(subscription.current_period_end * 1000)
+        nextPaymentDate = d.toLocaleDateString("en-US", {
+          month: "short",
+          day: "numeric",
+          year: "numeric",
+        })
+      }
+    }
+
+    const profile = {
+      ...data,
+      nextPaymentDate,
+      subscriptionTier: data.plan || data.subscriptionTier || "Starter",
+    }
+
+    res.json({ profile })
+  } catch (err) {
+    console.error("dashboard-profile error:", err)
+    res.status(500).json({ error: "Server error" })
+  }
+})
+app.post("/api/update-profile", async (req, res) => {
+  try {
+    const { session_id, name, city, state, phone } = req.body
+    if (!session_id) {
+      return res.status(400).json({ error: "Missing session_id" })
+    }
+
+    const session = await stripe.checkout.sessions.retrieve(session_id, {
+      expand: ["customer"],
+    })
+
+    const email =
+      session.customer_details?.email ||
+      (session.customer && session.customer.email)
+
+    if (!email) {
+      return res.status(404).json({ error: "No email on session" })
+    }
+
+    const updates = {
+      name,
+      city,
+      state,
+      phone,
+      updated_at: new Date().toISOString(),
+    }
+
+    const { data, error } = await supabase
+      .from("movers") // change if your table name is different
+      .update(updates)
+      .eq("email", email)
+      .select("*")
+      .single()
+
+    if (error || !data) {
+      console.error("update-profile error:", error)
+      return res.status(500).json({ error: "Failed to update profile" })
+    }
+
+    res.json({ ok: true, profile: data })
+  } catch (err) {
+    console.error("update-profile error:", err)
+    res.status(500).json({ error: "Server error" })
+  }
+})
 
     // 1) create auth user
     const { data: authUser, error: authErr } = await supabase.auth.admin.createUser({
