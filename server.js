@@ -26,6 +26,76 @@ const airtable = new Airtable({ apiKey: process.env.AIRTABLE_API_KEY }).base(
 
 const moversTable = () =>
   airtable.table(process.env.AIRTABLE_TABLE_NAME || "Movers")
+// Upsert Airtable row so listings always match the latest profile
+async function upsertAirtableMoverFromProfile(profileRow) {
+  try {
+    // If Airtable isn’t configured, quietly skip
+    if (
+      !process.env.AIRTABLE_API_KEY ||
+      !process.env.AIRTABLE_BASE_ID ||
+      !process.env.AIRTABLE_TABLE_NAME
+    ) {
+      console.log("Airtable env not fully set, skipping sync")
+      return
+    }
+
+    if (!profileRow || !profileRow.email) {
+      console.log("No profileRow or email passed to upsertAirtableMoverFromProfile")
+      return
+    }
+
+    const email = profileRow.email
+    const name =
+      profileRow.business_name ||
+      profileRow.full_name ||
+      "Mover"
+
+    const phone = profileRow.phone_e164 || ""
+    const city = profileRow.city || ""
+    const state = profileRow.state || ""
+    const logoUrl = profileRow.logo_url || ""
+    const plan = profileRow.plan || "Starter"
+
+    // 🔍 Look up existing row by Email
+    const records = await moversTable()
+      .select({
+        filterByFormula: `{Email} = "${email}"`,
+        maxRecords: 1,
+      })
+      .firstPage()
+
+    const fields = {
+      Email: email,
+      Name: name,
+      Phone: phone,
+      City: city,
+      State: state,
+      Plan: plan,
+    }
+
+    if (logoUrl) {
+      fields.Logo = [{ url: logoUrl }]
+    }
+
+    if (records.length > 0) {
+      // ✏️ Update existing row
+      await moversTable().update([
+        {
+          id: records[0].id,
+          fields,
+        },
+      ])
+      console.log("✅ Updated Airtable mover row for:", email)
+    } else {
+      // ➕ Create new row
+      await moversTable().create([{ fields }])
+      console.log("✅ Created Airtable mover row for:", email)
+    }
+  } catch (err) {
+    console.error("Airtable sync failed:", err)
+    // Don’t throw – never block signup/dashboard because of Airtable
+  }
+}
 
 /* ------------------------- helpers ------------------------- */
 
@@ -357,6 +427,8 @@ app.post("/api/update-profile", async (req, res) => {
         .status(500)
         .json({ ok: false, error: "Failed to update profile" })
     }
+// 🔄 Keep Airtable "Movers" row in sync
+await upsertAirtableMoverFromProfile(data)
 
     // Keep Airtable "Movers" row in sync with this profile
     await upsertAirtableMoverFromProfile(data)
@@ -423,6 +495,17 @@ app.post("/api/signup", async (req, res) => {
       console.error("Supabase insert error:", insertErr)
       return res.status(400).json({ error: insertErr.message })
     }
+// 2.5) Sync to Airtable movers table
+await upsertAirtableMoverFromProfile({
+  email,
+  full_name: fullName || "",
+  business_name: businessName || "",
+  phone_e164: phoneE164 || "",
+  city: "",
+  state: "",
+  logo_url: "",
+  plan,
+})
 
     // 3) Stripe customer
     const customer = await stripe.customers.create({
@@ -461,8 +544,9 @@ app.post("/api/signup", async (req, res) => {
   process.env.PUBLIC_URL ||
   'https://fortuitous-book-118427.framer.app'
 }/dashboard?session_id={CHECKOUT_SESSION_ID}&email=${encodeURIComponent(email)}`,
-
-      cancel_url: `${baseUrl}/signup?canceled=1`,
+      cancel_url: `${
+    process.env.PUBLIC_URL || 'https://fortuitous-book-118427.framer.app'
+  }/signup?canceled=1`,
     })
 
     return res.json({ url: session.url })
