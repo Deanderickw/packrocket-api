@@ -1,31 +1,4 @@
-/* ========= PackRocket API — Express + Supabase + Stripe + Airtable ========= */
-const express = require("express")
-const cors = require("cors")
-const Stripe = require("stripe")
-const { createClient } = require("@supabase/supabase-js")
-const Airtable = require("airtable")
-require("dotenv").config()
 
-const PORT = process.env.PORT || 5050
-const app = express()
-
-/* ------------------------- init clients ------------------------- */
-
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
-  apiVersion: "2024-06-20",
-})
-
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-)
-
-const airtable = new Airtable({ apiKey: process.env.AIRTABLE_API_KEY }).base(
-  process.env.AIRTABLE_BASE_ID || ""
-)
-
-const moversTable = () =>
-  airtable.table(process.env.AIRTABLE_TABLE_NAME || "Movers")
 // Upsert Airtable row so listings always match the latest profile
 async function upsertAirtableMoverFromProfile(profileRow) {
   try {
@@ -427,8 +400,7 @@ app.post("/api/update-profile", async (req, res) => {
         .status(500)
         .json({ ok: false, error: "Failed to update profile" })
     }
-// 🔄 Keep Airtable "Movers" row in sync
-await upsertAirtableMoverFromProfile(data)
+
 
     // Keep Airtable "Movers" row in sync with this profile
     await upsertAirtableMoverFromProfile(data)
@@ -506,28 +478,6 @@ await upsertAirtableMoverFromProfile({
   logo_url: "",
   plan,
 })
-
-    // 3) Stripe customer
-    const customer = await stripe.customers.create({
-      email,
-      name: fullName || businessName || email,
-      metadata: { user_id: user.id, plan },
-    })
-
-    await supabase
-      .from("profiles")
-      .update({ stripe_customer_id: customer.id })
-      .eq("id", user.id)
-
-    // 4) (Optional) also upsert Airtable row on signup so they appear in Movers
-    await upsertAirtableMoverFromProfile({
-      id: user.id,
-      email,
-      full_name: fullName || "",
-      business_name: businessName || "",
-      phone_e164: phoneE164 || "",
-      plan,
-    })
 
     // 5) Checkout session
     const baseUrl =
