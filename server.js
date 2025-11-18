@@ -1,73 +1,41 @@
+/* ========= PackRocket API — Express + Supabase + Stripe + Airtable ========= */
+const express = require("express")
+const cors = require("cors")
+const Stripe = require("stripe")
+const { createClient } = require("@supabase/supabase-js")
+const Airtable = require("airtable")
+require("dotenv").config()
 
-// Upsert Airtable row so listings always match the latest profile
-async function upsertAirtableMoverFromProfile(profileRow) {
-  try {
-    // If Airtable isn’t configured, quietly skip
-    if (
-      !process.env.AIRTABLE_API_KEY ||
-      !process.env.AIRTABLE_BASE_ID ||
-      !process.env.AIRTABLE_TABLE_NAME
-    ) {
-      console.log("Airtable env not fully set, skipping sync")
-      return
-    }
+const PORT = process.env.PORT || 5050
+const app = express() // ✅ THIS is what was “missing” in your failing deploy
 
-    if (!profileRow || !profileRow.email) {
-      console.log("No profileRow or email passed to upsertAirtableMoverFromProfile")
-      return
-    }
+/* ------------------------- init clients ------------------------- */
 
-    const email = profileRow.email
-    const name =
-      profileRow.business_name ||
-      profileRow.full_name ||
-      "Mover"
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
+  apiVersion: "2024-06-20",
+})
 
-    const phone = profileRow.phone_e164 || ""
-    const city = profileRow.city || ""
-    const state = profileRow.state || ""
-    const logoUrl = profileRow.logo_url || ""
-    const plan = profileRow.plan || "Starter"
+const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+)
 
-    // 🔍 Look up existing row by Email
-    const records = await moversTable()
-      .select({
-        filterByFormula: `{Email} = "${email}"`,
-        maxRecords: 1,
-      })
-      .firstPage()
+/* ------------------------- Airtable setup ------------------------- */
 
-    const fields = {
-      Email: email,
-      Name: name,
-      Phone: phone,
-      City: city,
-      State: state,
-      Plan: plan,
-    }
+let airtableBase = null
+if (process.env.AIRTABLE_API_KEY && process.env.AIRTABLE_BASE_ID) {
+  airtableBase = new Airtable({
+    apiKey: process.env.AIRTABLE_API_KEY,
+  }).base(process.env.AIRTABLE_BASE_ID)
+} else {
+  console.log("⚠️ Airtable not fully configured (API key or Base ID missing)")
+}
 
-    if (logoUrl) {
-      fields.Logo = [{ url: logoUrl }]
-    }
+const moversTableName = process.env.AIRTABLE_TABLE_NAME || "Movers"
 
-    if (records.length > 0) {
-      // ✏️ Update existing row
-      await moversTable().update([
-        {
-          id: records[0].id,
-          fields,
-        },
-      ])
-      console.log("✅ Updated Airtable mover row for:", email)
-    } else {
-      // ➕ Create new row
-      await moversTable().create([{ fields }])
-      console.log("✅ Created Airtable mover row for:", email)
-    }
-  } catch (err) {
-    console.error("Airtable sync failed:", err)
-    // Don’t throw – never block signup/dashboard because of Airtable
-  }
+const moversTable = () => {
+  if (!airtableBase) return null
+  return airtableBase(moversTableName) // ✅ base("<BASE>").table("<TABLE>") pattern
 }
 
 /* ------------------------- helpers ------------------------- */
@@ -130,33 +98,40 @@ function mapProfileToMover(profileRow) {
   }
 }
 
-// Upsert Airtable row so listings always match the latest profile
+// ✅ Single, clean Airtable sync helper
 async function upsertAirtableMoverFromProfile(profileRow) {
   try {
+    const table = moversTable()
+
     if (
       !process.env.AIRTABLE_API_KEY ||
       !process.env.AIRTABLE_BASE_ID ||
-      !process.env.AIRTABLE_TABLE_NAME
+      !moversTableName ||
+      !table
     ) {
-      // Airtable not configured, skip silently
+      console.log("Airtable env not fully set or table missing, skipping sync")
       return
     }
 
-    if (!profileRow || !profileRow.email) return
+    if (!profileRow || !profileRow.email) {
+      console.log("No profileRow or email passed to upsertAirtableMoverFromProfile")
+      return
+    }
 
     const email = profileRow.email
     const name =
       profileRow.business_name ||
       profileRow.full_name ||
       "Mover"
+
     const phone = profileRow.phone_e164 || ""
     const city = profileRow.city || ""
     const state = profileRow.state || ""
     const logoUrl = profileRow.logo_url || ""
     const plan = profileRow.plan || "Starter"
 
-    // Find existing Airtable row by Email
-    const records = await moversTable()
+    // 🔍 Look up existing row by Email
+    const records = await table
       .select({
         filterByFormula: `{Email} = "${email}"`,
         maxRecords: 1,
@@ -177,20 +152,22 @@ async function upsertAirtableMoverFromProfile(profileRow) {
     }
 
     if (records.length > 0) {
-      // Update existing row
-      await moversTable().update([
+      // ✏️ Update existing row
+      await table.update([
         {
           id: records[0].id,
           fields,
         },
       ])
+      console.log("✅ Updated Airtable mover row for:", email)
     } else {
-      // Create new row
-      await moversTable().create([{ fields }])
+      // ➕ Create new row
+      await table.create([{ fields }])
+      console.log("✅ Created Airtable mover row for:", email)
     }
   } catch (err) {
     console.error("Airtable sync failed:", err)
-    // Don't throw – we never want this to break signup/update
+    // Don’t throw – never block signup/dashboard because of Airtable
   }
 }
 
@@ -302,6 +279,11 @@ app.get("/api/_debug", (_req, res) => {
     cwd: process.cwd(),
     stripeKeyPrefix: (process.env.STRIPE_SECRET_KEY || "").slice(0, 8),
     prices: PRICE_IDS,
+    airtableConfigured: !!(
+      process.env.AIRTABLE_API_KEY &&
+      process.env.AIRTABLE_BASE_ID &&
+      moversTableName
+    ),
   })
 })
 
@@ -401,8 +383,7 @@ app.post("/api/update-profile", async (req, res) => {
         .json({ ok: false, error: "Failed to update profile" })
     }
 
-
-    // Keep Airtable "Movers" row in sync with this profile
+    // ✅ Keep Airtable "Movers" row in sync with this profile
     await upsertAirtableMoverFromProfile(data)
 
     const mover = mapProfileToMover(data)
@@ -467,19 +448,33 @@ app.post("/api/signup", async (req, res) => {
       console.error("Supabase insert error:", insertErr)
       return res.status(400).json({ error: insertErr.message })
     }
-// 2.5) Sync to Airtable movers table
-await upsertAirtableMoverFromProfile({
-  email,
-  full_name: fullName || "",
-  business_name: businessName || "",
-  phone_e164: phoneE164 || "",
-  city: "",
-  state: "",
-  logo_url: "",
-  plan,
-})
 
-    // 5) Checkout session
+    // 2.5) Sync to Airtable movers table (basic fields)
+    await upsertAirtableMoverFromProfile({
+      id: user.id,
+      email,
+      full_name: fullName || "",
+      business_name: businessName || "",
+      phone_e164: phoneE164 || "",
+      city: "",
+      state: "",
+      logo_url: "",
+      plan,
+    })
+
+    // 3) Stripe customer
+    const customer = await stripe.customers.create({
+      email,
+      name: fullName || businessName || email,
+      metadata: { user_id: user.id, plan },
+    })
+
+    await supabase
+      .from("profiles")
+      .update({ stripe_customer_id: customer.id })
+      .eq("id", user.id)
+
+    // 4) Checkout session
     const baseUrl =
       process.env.PUBLIC_URL ||
       "https://fortuitous-book-118427.framer.app"
@@ -490,13 +485,10 @@ await upsertAirtableMoverFromProfile({
       line_items: [
         { price: PRICE_IDS[plan] || PRICE_IDS.Starter, quantity: 1 },
       ],
-      success_url: `${
-  process.env.PUBLIC_URL ||
-  'https://fortuitous-book-118427.framer.app'
-}/dashboard?session_id={CHECKOUT_SESSION_ID}&email=${encodeURIComponent(email)}`,
-      cancel_url: `${
-    process.env.PUBLIC_URL || 'https://fortuitous-book-118427.framer.app'
-  }/signup?canceled=1`,
+      success_url: `${baseUrl}/dashboard?session_id={CHECKOUT_SESSION_ID}&email=${encodeURIComponent(
+        email
+      )}`,
+      cancel_url: `${baseUrl}/signup?canceled=1`,
     })
 
     return res.json({ url: session.url })
