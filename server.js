@@ -497,6 +497,114 @@ app.post("/api/signup", async (req, res) => {
     return res.status(500).json({ error: "Signup failed" })
   }
 })
+/* --------------------- Stripe Billing Portal (manage) --------------------- */
+
+// GET /api/stripe/manage-billing?email=someone@example.com
+app.get("/api/stripe/manage-billing", async (req, res) => {
+  try {
+    const email = req.query.email
+    if (!email) {
+      return res.status(400).json({ ok: false, error: "Missing email" })
+    }
+
+    // Look up profile by email to get Stripe customer id
+    const { data: profile, error } = await supabase
+      .from("profiles")
+      .select("id, stripe_customer_id")
+      .eq("email", email)
+      .single()
+
+    if (error) {
+      console.error("manage-billing supabase error:", error)
+      return res
+        .status(500)
+        .json({ ok: false, error: "Profile lookup failed" })
+    }
+
+    if (!profile || !profile.stripe_customer_id) {
+      return res
+        .status(404)
+        .json({ ok: false, error: "No Stripe customer for this email" })
+    }
+
+    const baseUrl =
+      process.env.PUBLIC_URL ||
+      "https://fortuitous-book-118427.framer.app"
+
+    const portalSession = await stripe.billingPortal.sessions.create({
+      customer: profile.stripe_customer_id,
+      return_url: `${baseUrl}/dashboard?email=${encodeURIComponent(email)}`,
+    })
+
+    // redirect straight to Stripe portal (so window.open works)
+    return res.redirect(303, portalSession.url)
+  } catch (err) {
+    console.error("manage-billing route error:", err)
+    return res.status(500).json({ ok: false, error: "Server error" })
+  }
+})
+
+/* ---------------------- Cancel subscription (Stripe) ---------------------- */
+
+// POST /api/stripe/cancel-subscription  { email }
+app.post("/api/stripe/cancel-subscription", async (req, res) => {
+  try {
+    const { email } = req.body || {}
+
+    if (!email) {
+      return res.status(400).json({ ok: false, error: "Missing email" })
+    }
+
+    const { data: profile, error } = await supabase
+      .from("profiles")
+      .select("id, stripe_subscription_id, stripe_customer_id")
+      .eq("email", email)
+      .single()
+
+    if (error) {
+      console.error("cancel-subscription supabase error:", error)
+      return res
+        .status(500)
+        .json({ ok: false, error: "Profile lookup failed" })
+    }
+
+    if (!profile || !profile.stripe_subscription_id) {
+      return res.status(400).json({
+        ok: false,
+        error: "No active subscription found for this user",
+      })
+    }
+
+    // Set cancel at period end (they keep access until current period ends)
+    const updatedSub = await stripe.subscriptions.update(
+      profile.stripe_subscription_id,
+      { cancel_at_period_end: true }
+    )
+
+    // Save latest info back to Supabase
+    await supabase
+      .from("profiles")
+      .update({
+        status: "cancelling",
+        stripe_subscription_id: updatedSub.id,
+        current_period_end: new Date(
+          updatedSub.current_period_end * 1000
+        ).toISOString(),
+      })
+      .eq("id", profile.id)
+
+    return res.json({
+      ok: true,
+      subscriptionId: updatedSub.id,
+      current_period_end: new Date(
+        updatedSub.current_period_end * 1000
+      ).toISOString(),
+    })
+  } catch (err) {
+    console.error("cancel-subscription route error:", err)
+    return res.status(500).json({ ok: false, error: "Server error" })
+  }
+})
 
 /* --------------------------------- Start ---------------------------------- */
 
