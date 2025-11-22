@@ -7,7 +7,7 @@ const Airtable = require("airtable")
 require("dotenv").config()
 
 const PORT = process.env.PORT || 5050
-const app = express() // ✅ THIS is what was “missing” in your failing deploy
+const app = express() // ✅ Express app
 
 /* ------------------------- init clients ------------------------- */
 
@@ -35,7 +35,7 @@ const moversTableName = process.env.AIRTABLE_TABLE_NAME || "Movers"
 
 const moversTable = () => {
   if (!airtableBase) return null
-  return airtableBase(moversTableName) // ✅ base("<BASE>").table("<TABLE>") pattern
+  return airtableBase(moversTableName)
 }
 
 /* ------------------------- helpers ------------------------- */
@@ -51,6 +51,7 @@ function computeProfileCompletion(profile) {
     profile.city,
     profile.state,
     profile.logo_url,
+    // You *could* include profile.starting_price here if you want it in completion
   ]
 
   const filled = fields.filter((v) => v && String(v).trim() !== "").length
@@ -92,11 +93,18 @@ function mapProfileToMover(profileRow) {
     verified: true, // tweak later if you want real verification
     rating: 4.9, // placeholder
     jobsCompleted: 0, // placeholder
-    startingPrice: undefined,
+    // 👇 force it to a Number if it exists
+    startingPrice:
+      profileRow.starting_price !== null &&
+      profileRow.starting_price !== undefined &&
+      profileRow.starting_price !== ""
+        ? Number(profileRow.starting_price)
+        : undefined,
     features: [],
     profileCompletion: computeProfileCompletion(profileRow),
   }
 }
+
 
 // ✅ Single, clean Airtable sync helper
 async function upsertAirtableMoverFromProfile(profileRow) {
@@ -129,6 +137,7 @@ async function upsertAirtableMoverFromProfile(profileRow) {
     const state = profileRow.state || ""
     const logoUrl = profileRow.logo_url || ""
     const plan = profileRow.plan || "Starter"
+    const startingPrice = profileRow.starting_price || null
 
     // 🔍 Look up existing row by Email
     const records = await table
@@ -149,6 +158,11 @@ async function upsertAirtableMoverFromProfile(profileRow) {
 
     if (logoUrl) {
       fields.Logo = [{ url: logoUrl }]
+    }
+
+    if (startingPrice !== null) {
+      // Airtable field will auto-create if it doesn't exist
+      fields["Starting price"] = startingPrice
     }
 
     if (records.length > 0) {
@@ -348,6 +362,7 @@ app.post("/api/update-profile", async (req, res) => {
       city,
       state,
       logo_url,
+      starting_price, // 👈 NEW
     } = req.body
 
     if (!email) {
@@ -361,6 +376,7 @@ app.post("/api/update-profile", async (req, res) => {
       city,
       state,
       logo_url,
+      starting_price, // 👈 NEW
       updated_at: new Date().toISOString(),
     }
 
@@ -460,6 +476,7 @@ app.post("/api/signup", async (req, res) => {
       state: "",
       logo_url: "",
       plan,
+      // starting_price not set at signup yet
     })
 
     // 3) Stripe customer
@@ -497,6 +514,7 @@ app.post("/api/signup", async (req, res) => {
     return res.status(500).json({ error: "Signup failed" })
   }
 })
+
 /* --------------------- Stripe Billing Portal (manage) --------------------- */
 
 // GET /api/stripe/manage-billing?email=someone@example.com
