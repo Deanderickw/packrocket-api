@@ -4,6 +4,7 @@ const cors = require("cors")
 const Stripe = require("stripe")
 const { createClient } = require("@supabase/supabase-js")
 const Airtable = require("airtable")
+const multer = require("multer")
 require("dotenv").config()
 
 const PORT = process.env.PORT || 5050
@@ -19,6 +20,14 @@ const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 )
+
+// 🆕 Logo upload config (Supabase Storage)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 2 * 1024 * 1024 }, // 2 MB max
+})
+
+const LOGO_BUCKET = process.env.SUPABASE_LOGO_BUCKET || "logos"
 
 /* ------------------------- Airtable setup ------------------------- */
 
@@ -51,7 +60,7 @@ function computeProfileCompletion(profile) {
     profile.city,
     profile.state,
     profile.logo_url,
-    // You *could* include profile.starting_price here if you want it in completion
+    // optionally include starting_price if you want
   ]
 
   const filled = fields.filter((v) => v && String(v).trim() !== "").length
@@ -90,10 +99,9 @@ function mapProfileToMover(profileRow) {
     city: profileRow.city || "",
     state: profileRow.state || "",
     logo: profileRow.logo_url || "",
-    verified: true, // tweak later if you want real verification
+    verified: true, // tweak later for real verification
     rating: 4.9, // placeholder
     jobsCompleted: 0, // placeholder
-    // 👇 force it to a Number if it exists
     startingPrice:
       profileRow.starting_price !== null &&
       profileRow.starting_price !== undefined &&
@@ -104,7 +112,6 @@ function mapProfileToMover(profileRow) {
     profileCompletion: computeProfileCompletion(profileRow),
   }
 }
-
 
 // ✅ Single, clean Airtable sync helper
 async function upsertAirtableMoverFromProfile(profileRow) {
@@ -161,7 +168,6 @@ async function upsertAirtableMoverFromProfile(profileRow) {
     }
 
     if (startingPrice !== null) {
-      // Airtable field will auto-create if it doesn't exist
       fields["Starting price"] = startingPrice
     }
 
@@ -282,6 +288,75 @@ app.post(
 
 app.use(express.json()) // ✅ after webhook
 
+/* ---------------------------- Upload logo route ---------------------------- */
+/**
+ * POST /api/upload-logo
+ * Body: multipart/form-data with:
+ *   - email (string)
+ *   - file  (image)
+ *
+ * Returns: { ok: true, url: string }
+ */
+app.post(
+  "/api/upload-logo",
+  upload.single("file"),
+  async (req, res) => {
+    try {
+      const email = req.body.email
+      const file = req.file
+
+      if (!email) {
+        return res.status(400).json({ ok: false, error: "Missing email" })
+      }
+
+      if (!file) {
+        return res.status(400).json({ ok: false, error: "Missing file" })
+      }
+
+      const originalName = file.originalname || "logo.png"
+      const ext = originalName.includes(".")
+        ? originalName.split(".").pop()
+        : "png"
+
+      // path inside the bucket (NOT including bucket name)
+      const safeEmail = email.replace(/[^a-zA-Z0-9@._-]/g, "_")
+      const filePath = `${safeEmail}/${Date.now()}-logo.${ext}`
+
+      const { error: uploadError } = await supabase.storage
+        .from(LOGO_BUCKET)
+        .upload(filePath, file.buffer, {
+          contentType: file.mimetype || "image/png",
+          upsert: false,
+        })
+
+      if (uploadError) {
+        console.error("Supabase storage upload error:", uploadError)
+        return res
+          .status(500)
+          .json({ ok: false, error: "Failed to upload logo" })
+      }
+
+      const {
+        data: { publicUrl },
+      } = supabase.storage.from(LOGO_BUCKET).getPublicUrl(filePath)
+
+      if (!publicUrl) {
+        return res
+          .status(500)
+          .json({ ok: false, error: "Could not get public logo URL" })
+      }
+
+      return res.json({
+        ok: true,
+        url: publicUrl,
+      })
+    } catch (err) {
+      console.error("/api/upload-logo error:", err)
+      return res.status(500).json({ ok: false, error: "Server error" })
+    }
+  }
+)
+
 /* ----------------------------- Health check ------------------------------- */
 
 app.get("/api/health", (_req, res) => res.json({ ok: true }))
@@ -298,6 +373,7 @@ app.get("/api/_debug", (_req, res) => {
       process.env.AIRTABLE_BASE_ID &&
       moversTableName
     ),
+    logoBucket: LOGO_BUCKET,
   })
 })
 
@@ -322,7 +398,6 @@ app.get("/api/mover-dashboard", async (req, res) => {
     if (error) {
       console.error("Supabase profile error:", error)
 
-      // If no rows found, respond as "not found" instead of 500
       if (error.code === "PGRST116") {
         return res.status(404).json({ ok: false, error: "Profile not found" })
       }
@@ -362,7 +437,7 @@ app.post("/api/update-profile", async (req, res) => {
       city,
       state,
       logo_url,
-      starting_price, // 👈 NEW
+      starting_price,
     } = req.body
 
     if (!email) {
@@ -376,11 +451,10 @@ app.post("/api/update-profile", async (req, res) => {
       city,
       state,
       logo_url,
-      starting_price, // 👈 NEW
+      starting_price,
       updated_at: new Date().toISOString(),
     }
 
-    // Remove undefined so we don't overwrite with null
     Object.keys(updates).forEach((k) => {
       if (updates[k] === undefined) delete updates[k]
     })
@@ -457,7 +531,7 @@ app.post("/api/signup", async (req, res) => {
       phone_e164: phoneE164 || "",
       sms_opt_in: !!smsOptIn,
       plan,
-      status: "pending", // allowed
+      status: "pending",
     })
 
     if (insertErr) {
@@ -476,7 +550,6 @@ app.post("/api/signup", async (req, res) => {
       state: "",
       logo_url: "",
       plan,
-      // starting_price not set at signup yet
     })
 
     // 3) Stripe customer
@@ -517,7 +590,6 @@ app.post("/api/signup", async (req, res) => {
 
 /* --------------------- Stripe Billing Portal (manage) --------------------- */
 
-// GET /api/stripe/manage-billing?email=someone@example.com
 app.get("/api/stripe/manage-billing", async (req, res) => {
   try {
     const email = req.query.email
@@ -525,7 +597,6 @@ app.get("/api/stripe/manage-billing", async (req, res) => {
       return res.status(400).json({ ok: false, error: "Missing email" })
     }
 
-    // Look up profile by email to get Stripe customer id
     const { data: profile, error } = await supabase
       .from("profiles")
       .select("id, stripe_customer_id")
@@ -554,7 +625,6 @@ app.get("/api/stripe/manage-billing", async (req, res) => {
       return_url: `${baseUrl}/dashboard?email=${encodeURIComponent(email)}`,
     })
 
-    // redirect straight to Stripe portal (so window.open works)
     return res.redirect(303, portalSession.url)
   } catch (err) {
     console.error("manage-billing route error:", err)
@@ -564,7 +634,6 @@ app.get("/api/stripe/manage-billing", async (req, res) => {
 
 /* ---------------------- Cancel subscription (Stripe) ---------------------- */
 
-// POST /api/stripe/cancel-subscription  { email }
 app.post("/api/stripe/cancel-subscription", async (req, res) => {
   try {
     const { email } = req.body || {}
@@ -593,13 +662,11 @@ app.post("/api/stripe/cancel-subscription", async (req, res) => {
       })
     }
 
-    // Set cancel at period end (they keep access until current period ends)
     const updatedSub = await stripe.subscriptions.update(
       profile.stripe_subscription_id,
       { cancel_at_period_end: true }
     )
 
-    // Save latest info back to Supabase
     await supabase
       .from("profiles")
       .update({
