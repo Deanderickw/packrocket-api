@@ -49,6 +49,12 @@ const moversTable = () => {
 
 /* ------------------------- helpers ------------------------- */
 
+// Normalize email (trim + lowercase)
+function normalizeEmail(email) {
+  if (!email) return ""
+  return String(email).trim().toLowerCase()
+}
+
 // Compute profile completion (0–100%)
 function computeProfileCompletion(profile) {
   if (!profile) return 0
@@ -133,7 +139,7 @@ async function upsertAirtableMoverFromProfile(profileRow) {
       return
     }
 
-    const email = profileRow.email
+    const email = normalizeEmail(profileRow.email)
     const name =
       profileRow.business_name ||
       profileRow.full_name ||
@@ -302,7 +308,8 @@ app.post(
   upload.single("file"),
   async (req, res) => {
     try {
-      const email = req.body.email
+      const rawEmail = req.body.email
+      const email = normalizeEmail(rawEmail)
       const file = req.file
 
       if (!email) {
@@ -382,17 +389,20 @@ app.get("/api/_debug", (_req, res) => {
 // GET /api/mover-dashboard?email=someone@example.com
 app.get("/api/mover-dashboard", async (req, res) => {
   try {
-    const email = req.query.email
+    const rawEmail = req.query.email
 
-    if (!email) {
+    if (!rawEmail) {
       return res.status(400).json({ ok: false, error: "Missing email" })
     }
+
+    const email = normalizeEmail(rawEmail)
+    console.log("📩 mover-dashboard lookup for email:", email)
 
     // Get the mover profile from Supabase 'profiles' table
     const { data: profile, error } = await supabase
       .from("profiles")
       .select("*")
-      .eq("email", email)
+      .ilike("email", email) // 👈 case-insensitive email match
       .single()
 
     if (error) {
@@ -444,6 +454,8 @@ app.post("/api/update-profile", async (req, res) => {
       return res.status(400).json({ ok: false, error: "Missing email" })
     }
 
+    const normalizedEmail = normalizeEmail(email)
+
     const updates = {
       full_name,
       business_name,
@@ -462,7 +474,7 @@ app.post("/api/update-profile", async (req, res) => {
     const { data, error } = await supabase
       .from("profiles")
       .update(updates)
-      .eq("email", email)
+      .eq("email", normalizedEmail)
       .select("*")
       .single()
 
@@ -507,10 +519,12 @@ app.post("/api/signup", async (req, res) => {
       return res.status(400).json({ error: "Missing required fields" })
     }
 
+    const normalizedEmail = normalizeEmail(email)
+
     // 1) Create auth user
     const { data: authUser, error: authErr } =
       await supabase.auth.admin.createUser({
-        email,
+        email: normalizedEmail,
         password,
         email_confirm: true,
       })
@@ -525,7 +539,7 @@ app.post("/api/signup", async (req, res) => {
     // 2) Insert profile
     const { error: insertErr } = await supabase.from("profiles").insert({
       id: user.id,
-      email,
+      email: normalizedEmail,
       full_name: fullName || "",
       business_name: businessName || "",
       phone_e164: phoneE164 || "",
@@ -542,7 +556,7 @@ app.post("/api/signup", async (req, res) => {
     // 2.5) Sync to Airtable movers table (basic fields)
     await upsertAirtableMoverFromProfile({
       id: user.id,
-      email,
+      email: normalizedEmail,
       full_name: fullName || "",
       business_name: businessName || "",
       phone_e164: phoneE164 || "",
@@ -554,8 +568,8 @@ app.post("/api/signup", async (req, res) => {
 
     // 3) Stripe customer
     const customer = await stripe.customers.create({
-      email,
-      name: fullName || businessName || email,
+      email: normalizedEmail,
+      name: fullName || businessName || normalizedEmail,
       metadata: { user_id: user.id, plan },
     })
 
@@ -576,7 +590,7 @@ app.post("/api/signup", async (req, res) => {
         { price: PRICE_IDS[plan] || PRICE_IDS.Starter, quantity: 1 },
       ],
       success_url: `${baseUrl}/dashboard?session_id={CHECKOUT_SESSION_ID}&email=${encodeURIComponent(
-        email
+        normalizedEmail
       )}`,
       cancel_url: `${baseUrl}/signup?canceled=1`,
     })
@@ -587,6 +601,7 @@ app.post("/api/signup", async (req, res) => {
     return res.status(500).json({ error: "Signup failed" })
   }
 })
+
 /* ------------------------------ Login route ------------------------------- */
 
 app.post("/api/login", async (req, res) => {
@@ -597,9 +612,11 @@ app.post("/api/login", async (req, res) => {
       return res.status(400).json({ ok: false, error: "Missing fields" })
     }
 
+    const normalizedEmail = normalizeEmail(email)
+
     // 1) Sign the user in
     const { data, error } = await supabase.auth.signInWithPassword({
-      email,
+      email: normalizedEmail,
       password,
     })
 
@@ -611,10 +628,10 @@ app.post("/api/login", async (req, res) => {
       })
     }
 
-    // 2) Success → return email + id
+    // 2) Success → return email + id (frontend will redirect using this email)
     return res.json({
       ok: true,
-      email,
+      email: normalizedEmail,
       userId: data.user.id,
     })
   } catch (err) {
@@ -627,15 +644,17 @@ app.post("/api/login", async (req, res) => {
 
 app.get("/api/stripe/manage-billing", async (req, res) => {
   try {
-    const email = req.query.email
-    if (!email) {
+    const rawEmail = req.query.email
+    if (!rawEmail) {
       return res.status(400).json({ ok: false, error: "Missing email" })
     }
+
+    const email = normalizeEmail(rawEmail)
 
     const { data: profile, error } = await supabase
       .from("profiles")
       .select("id, stripe_customer_id")
-      .eq("email", email)
+      .ilike("email", email)
       .single()
 
     if (error) {
@@ -677,10 +696,12 @@ app.post("/api/stripe/cancel-subscription", async (req, res) => {
       return res.status(400).json({ ok: false, error: "Missing email" })
     }
 
+    const normalizedEmail = normalizeEmail(email)
+
     const { data: profile, error } = await supabase
       .from("profiles")
       .select("id, stripe_subscription_id, stripe_customer_id")
-      .eq("email", email)
+      .ilike("email", normalizedEmail)
       .single()
 
     if (error) {
@@ -731,3 +752,4 @@ app.post("/api/stripe/cancel-subscription", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`✅ PackRocket API running on :${PORT}`)
 })
+
