@@ -395,24 +395,27 @@ app.get("/api/mover-dashboard", async (req, res) => {
       return res.status(400).json({ ok: false, error: "Missing email" })
     }
 
-    const email = normalizeEmail(rawEmail)
-    console.log("📩 mover-dashboard lookup for email:", email)
+    // 🧹 Clean the email: trim + lowercase
+    const email = String(rawEmail).trim().toLowerCase()
+    console.log("🔎 /api/mover-dashboard lookup for email:", email)
 
     // Get the mover profile from Supabase 'profiles' table
     const { data: profile, error } = await supabase
       .from("profiles")
       .select("*")
-      .ilike("email", email) // 👈 case-insensitive email match
-      .single()
+      .ilike("email", email) // case-insensitive match
+      .maybeSingle()        // avoid throwing when no rows
+
+    console.log("   ↳ Supabase profile result:", {
+      hasProfile: !!profile,
+      error: error ? error.message || error : null,
+    })
 
     if (error) {
       console.error("Supabase profile error:", error)
-
-      if (error.code === "PGRST116") {
-        return res.status(404).json({ ok: false, error: "Profile not found" })
-      }
-
-      return res.status(500).json({ ok: false, error: "Profile lookup failed" })
+      return res
+        .status(500)
+        .json({ ok: false, error: "Profile lookup failed" })
     }
 
     if (!profile) {
@@ -434,6 +437,7 @@ app.get("/api/mover-dashboard", async (req, res) => {
     return res.status(500).json({ ok: false, error: "Server error" })
   }
 })
+
 
 /* -------------------------- Update profile route -------------------------- */
 
