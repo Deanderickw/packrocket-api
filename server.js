@@ -587,6 +587,41 @@ app.post("/api/signup", async (req, res) => {
     return res.status(500).json({ error: "Signup failed" })
   }
 })
+/* ------------------------------ Login route ------------------------------- */
+
+app.post("/api/login", async (req, res) => {
+  try {
+    const { email, password } = req.body
+
+    if (!email || !password) {
+      return res.status(400).json({ ok: false, error: "Missing fields" })
+    }
+
+    // 1) Sign the user in
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email,
+      password,
+    })
+
+    if (error || !data?.user) {
+      console.error("Login error:", error)
+      return res.status(400).json({
+        ok: false,
+        error: "Invalid email or password",
+      })
+    }
+
+    // 2) Success → return email + id
+    return res.json({
+      ok: true,
+      email,
+      userId: data.user.id,
+    })
+  } catch (err) {
+    console.error("Login route error:", err)
+    return res.status(500).json({ ok: false, error: "Server error" })
+  }
+})
 
 /* --------------------- Stripe Billing Portal (manage) --------------------- */
 
