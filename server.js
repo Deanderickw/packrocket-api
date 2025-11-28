@@ -140,10 +140,7 @@ async function upsertAirtableMoverFromProfile(profileRow) {
     }
 
     const email = normalizeEmail(profileRow.email)
-    const name =
-      profileRow.business_name ||
-      profileRow.full_name ||
-      "Mover"
+    const name = profileRow.business_name || profileRow.full_name || "Mover"
 
     const phone = profileRow.phone_e164 || ""
     const city = profileRow.city || ""
@@ -303,66 +300,62 @@ app.use(express.json()) // ✅ after webhook
  *
  * Returns: { ok: true, url: string }
  */
-app.post(
-  "/api/upload-logo",
-  upload.single("file"),
-  async (req, res) => {
-    try {
-      const rawEmail = req.body.email
-      const email = normalizeEmail(rawEmail)
-      const file = req.file
+app.post("/api/upload-logo", upload.single("file"), async (req, res) => {
+  try {
+    const rawEmail = req.body.email
+    const email = normalizeEmail(rawEmail)
+    const file = req.file
 
-      if (!email) {
-        return res.status(400).json({ ok: false, error: "Missing email" })
-      }
-
-      if (!file) {
-        return res.status(400).json({ ok: false, error: "Missing file" })
-      }
-
-      const originalName = file.originalname || "logo.png"
-      const ext = originalName.includes(".")
-        ? originalName.split(".").pop()
-        : "png"
-
-      // path inside the bucket (NOT including bucket name)
-      const safeEmail = email.replace(/[^a-zA-Z0-9@._-]/g, "_")
-      const filePath = `${safeEmail}/${Date.now()}-logo.${ext}`
-
-      const { error: uploadError } = await supabase.storage
-        .from(LOGO_BUCKET)
-        .upload(filePath, file.buffer, {
-          contentType: file.mimetype || "image/png",
-          upsert: false,
-        })
-
-      if (uploadError) {
-        console.error("Supabase storage upload error:", uploadError)
-        return res
-          .status(500)
-          .json({ ok: false, error: "Failed to upload logo" })
-      }
-
-      const {
-        data: { publicUrl },
-      } = supabase.storage.from(LOGO_BUCKET).getPublicUrl(filePath)
-
-      if (!publicUrl) {
-        return res
-          .status(500)
-          .json({ ok: false, error: "Could not get public logo URL" })
-      }
-
-      return res.json({
-        ok: true,
-        url: publicUrl,
-      })
-    } catch (err) {
-      console.error("/api/upload-logo error:", err)
-      return res.status(500).json({ ok: false, error: "Server error" })
+    if (!email) {
+      return res.status(400).json({ ok: false, error: "Missing email" })
     }
+
+    if (!file) {
+      return res.status(400).json({ ok: false, error: "Missing file" })
+    }
+
+    const originalName = file.originalname || "logo.png"
+    const ext = originalName.includes(".")
+      ? originalName.split(".").pop()
+      : "png"
+
+    // path inside the bucket (NOT including bucket name)
+    const safeEmail = email.replace(/[^a-zA-Z0-9@._-]/g, "_")
+    const filePath = `${safeEmail}/${Date.now()}-logo.${ext}`
+
+    const { error: uploadError } = await supabase.storage
+      .from(LOGO_BUCKET)
+      .upload(filePath, file.buffer, {
+        contentType: file.mimetype || "image/png",
+        upsert: false,
+      })
+
+    if (uploadError) {
+      console.error("Supabase storage upload error:", uploadError)
+      return res
+        .status(500)
+        .json({ ok: false, error: "Failed to upload logo" })
+    }
+
+    const {
+      data: { publicUrl },
+    } = supabase.storage.from(LOGO_BUCKET).getPublicUrl(filePath)
+
+    if (!publicUrl) {
+      return res
+        .status(500)
+        .json({ ok: false, error: "Could not get public logo URL" })
+    }
+
+    return res.json({
+      ok: true,
+      url: publicUrl,
+    })
+  } catch (err) {
+    console.error("/api/upload-logo error:", err)
+    return res.status(500).json({ ok: false, error: "Server error" })
   }
-)
+})
 
 /* ----------------------------- Health check ------------------------------- */
 
@@ -384,32 +377,36 @@ app.get("/api/_debug", (_req, res) => {
   })
 })
 
-/* ------------------- Mover Dashboard route (by email) --------------------- */
+/* ------------------- Mover Dashboard route (email-only) ------------------- */
 
-// GET /api/mover-dashboard?email=...&userId=...
-// GET /api/mover-dashboard?email=someone@example.com
+// GET /api/mover-dashboard?email=...
 app.get("/api/mover-dashboard", async (req, res) => {
   try {
     const rawEmail = req.query.email
 
     if (!rawEmail) {
-      return res.status(400).json({ ok: false, error: "Missing email" })
+      return res
+        .status(400)
+        .json({ ok: false, error: "Missing email" })
     }
 
     const email = normalizeEmail(rawEmail)
 
-    console.log("🔎 /api/mover-dashboard lookup for email:", {
+    console.log("🔎 /api/mover-dashboard lookup", {
       rawEmail,
       normalizedEmail: email,
     })
 
-    const { data: profile, error } = await supabase
+    const result = await supabase
       .from("profiles")
       .select("*")
-      .ilike("email", `${email}%`) 
+      .eq("email", email)
       .maybeSingle()
 
-    console.log("   ↳ Supabase profile result:", {
+    const profile = result.data
+    const error = result.error
+
+    console.log("   ↳ profile lookup result:", {
       hasProfile: !!profile,
       profileEmail: profile?.email,
       error: error ? error.message || error : null,
@@ -423,7 +420,9 @@ app.get("/api/mover-dashboard", async (req, res) => {
     }
 
     if (!profile) {
-      return res.status(404).json({ ok: false, error: "Profile not found" })
+      return res
+        .status(404)
+        .json({ ok: false, error: "Profile not found" })
     }
 
     const mover = mapProfileToMover(profile)
@@ -441,8 +440,6 @@ app.get("/api/mover-dashboard", async (req, res) => {
     return res.status(500).json({ ok: false, error: "Server error" })
   }
 })
-
-
 
 /* -------------------------- Update profile route -------------------------- */
 
@@ -637,7 +634,7 @@ app.post("/api/login", async (req, res) => {
       })
     }
 
-    // 2) Success → return email + id (frontend will redirect using this email)
+    // 2) Success → return email + id (frontend only needs email now)
     return res.json({
       ok: true,
       email: normalizedEmail,
@@ -755,6 +752,7 @@ app.post("/api/stripe/cancel-subscription", async (req, res) => {
     return res.status(500).json({ ok: false, error: "Server error" })
   }
 })
+
 // TEMP: debug route to see some profiles from the API's perspective
 app.get("/api/_debug-profiles", async (_req, res) => {
   try {
@@ -775,4 +773,3 @@ app.get("/api/_debug-profiles", async (_req, res) => {
 app.listen(PORT, () => {
   console.log(`✅ PackRocket API running on :${PORT}`)
 })
-
