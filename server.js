@@ -406,7 +406,7 @@ app.get("/api/mover-dashboard", async (req, res) => {
     const { data: profile, error } = await supabase
       .from("profiles")
       .select("*")
-      .ilike("email", email)
+      .ilike("email", `${email}%`) 
       .maybeSingle()
 
     console.log("   ↳ Supabase profile result:", {
