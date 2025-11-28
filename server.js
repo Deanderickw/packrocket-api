@@ -755,6 +755,20 @@ app.post("/api/stripe/cancel-subscription", async (req, res) => {
     return res.status(500).json({ ok: false, error: "Server error" })
   }
 })
+// TEMP: debug route to see some profiles from the API's perspective
+app.get("/api/_debug-profiles", async (_req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("profiles")
+      .select("id, email")
+      .limit(10)
+
+    return res.json({ ok: !error, error, data })
+  } catch (err) {
+    console.error("_debug-profiles error:", err)
+    return res.status(500).json({ ok: false, error: "Server error" })
+  }
+})
 
 /* --------------------------------- Start ---------------------------------- */
 
