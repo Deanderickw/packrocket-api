@@ -387,63 +387,33 @@ app.get("/api/_debug", (_req, res) => {
 /* ------------------- Mover Dashboard route (by email) --------------------- */
 
 // GET /api/mover-dashboard?email=...&userId=...
+// GET /api/mover-dashboard?email=someone@example.com
 app.get("/api/mover-dashboard", async (req, res) => {
   try {
     const rawEmail = req.query.email
-    const userId = req.query.userId
 
-    if (!rawEmail && !userId) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Missing email or userId" })
+    if (!rawEmail) {
+      return res.status(400).json({ ok: false, error: "Missing email" })
     }
 
-    const email = rawEmail ? normalizeEmail(rawEmail) : null
+    const email = normalizeEmail(rawEmail)
 
-    console.log("🔎 /api/mover-dashboard lookup", {
+    console.log("🔎 /api/mover-dashboard lookup for email:", {
       rawEmail,
       normalizedEmail: email,
-      userId,
     })
 
-    let profile = null
-    let error = null
+    const { data: profile, error } = await supabase
+      .from("profiles")
+      .select("*")
+      .eq("email", email)
+      .maybeSingle()
 
-    // 1) Prefer lookup by userId (primary key)
-    if (userId) {
-      const result = await supabase
-        .from("profiles")
-        .select("*")
-        .eq("id", userId)
-        .maybeSingle()
-
-      profile = result.data
-      error = result.error
-
-      console.log("   ↳ lookup by id result:", {
-        hasProfile: !!profile,
-        profileEmail: profile?.email,
-        error: error ? error.message || error : null,
-      })
-    }
-
-    // 2) If no profile yet and we have an email, try by email
-    if (!profile && email) {
-      const result = await supabase
-        .from("profiles")
-        .select("*")
-        .eq("email", email)
-        .maybeSingle()
-
-      profile = result.data
-      error = result.error
-
-      console.log("   ↳ lookup by email result:", {
-        hasProfile: !!profile,
-        profileEmail: profile?.email,
-        error: error ? error.message || error : null,
-      })
-    }
+    console.log("   ↳ Supabase profile result:", {
+      hasProfile: !!profile,
+      profileEmail: profile?.email,
+      error: error ? error.message || error : null,
+    })
 
     if (error) {
       console.error("Supabase profile error:", error)
@@ -453,9 +423,7 @@ app.get("/api/mover-dashboard", async (req, res) => {
     }
 
     if (!profile) {
-      return res
-        .status(404)
-        .json({ ok: false, error: "Profile not found" })
+      return res.status(404).json({ ok: false, error: "Profile not found" })
     }
 
     const mover = mapProfileToMover(profile)
