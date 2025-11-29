@@ -527,36 +527,80 @@ app.post("/api/signup", async (req, res) => {
 
     const normalizedEmail = normalizeEmail(email)
 
-    // 1) Create auth user
-    const { data: authUser, error: authErr } =
-      await supabase.auth.admin.createUser({
-        email: normalizedEmail,
-        password,
-        email_confirm: true,
-      })
+    // 0) Check if a Supabase auth user already exists for this email
+    const { data: existingUserData, error: existingUserErr } =
+      await supabase.auth.admin.getUserByEmail(normalizedEmail)
 
-    if (authErr || !authUser?.user) {
-      console.error("Supabase auth error:", authErr)
-      return res.status(400).json({ error: "Auth create failed" })
+    let user = existingUserData?.user || null
+
+    if (existingUserErr) {
+      console.error("getUserByEmail error:", existingUserErr)
+      // not fatal, we can still try to create user below
     }
 
-    const user = authUser.user
+    // 1) If NO existing auth user → create one
+    if (!user) {
+      const { data: authUser, error: authErr } =
+        await supabase.auth.admin.createUser({
+          email: normalizedEmail,
+          password,
+          email_confirm: true,
+        })
 
-    // 2) Insert profile
-    const { error: insertErr } = await supabase.from("profiles").insert({
-      id: user.id,
-      email: normalizedEmail,
-      full_name: fullName || "",
-      business_name: businessName || "",
-      phone_e164: phoneE164 || "",
-      sms_opt_in: !!smsOptIn,
-      plan,
-      status: "pending",
-    })
+      if (authErr || !authUser?.user) {
+        console.error("Supabase auth error:", authErr)
+        return res.status(400).json({
+          error:
+            "We couldn't create your account with that email. Try a different email or log in instead.",
+        })
+      }
 
-    if (insertErr) {
-      console.error("Supabase insert error:", insertErr)
-      return res.status(400).json({ error: insertErr.message })
+      user = authUser.user
+    } else {
+      // We DO have an auth user already
+      // Check if they already have a profile row
+      const { data: existingProfile, error: profileErr } = await supabase
+        .from("profiles")
+        .select("*")
+        .eq("id", user.id)
+        .maybeSingle()
+
+      if (profileErr) {
+        console.error("profiles lookup error:", profileErr)
+      }
+
+      if (existingProfile) {
+        // ✅ Auth user + profile already exist → this is NOT a new signup
+        return res.status(400).json({
+          error:
+            "This email already has a PackRocket account. Try logging in or using Forgot password.",
+        })
+      }
+
+      // ❗ Auth user exists but no profile → we'll "repair" it below by creating a fresh profile
+      console.log(
+        "No profile for existing auth user, creating a new profile row."
+      )
+    }
+
+    // 2) Insert or update profile (for both new and repaired users)
+    const { error: upsertErr } = await supabase.from("profiles").upsert(
+      {
+        id: user.id,
+        email: normalizedEmail,
+        full_name: fullName || "",
+        business_name: businessName || "",
+        phone_e164: phoneE164 || "",
+        sms_opt_in: !!smsOptIn,
+        plan,
+        status: "pending",
+      },
+      { onConflict: "id" }
+    )
+
+    if (upsertErr) {
+      console.error("Supabase profile upsert error:", upsertErr)
+      return res.status(400).json({ error: upsertErr.message })
     }
 
     // 2.5) Sync to Airtable movers table (basic fields)
@@ -572,17 +616,31 @@ app.post("/api/signup", async (req, res) => {
       plan,
     })
 
-    // 3) Stripe customer
-    const customer = await stripe.customers.create({
-      email: normalizedEmail,
-      name: fullName || businessName || normalizedEmail,
-      metadata: { user_id: user.id, plan },
-    })
+    // 3) Stripe customer (create if missing)
+    let stripeCustomerId = null
 
-    await supabase
+    const { data: profileRow } = await supabase
       .from("profiles")
-      .update({ stripe_customer_id: customer.id })
+      .select("stripe_customer_id")
       .eq("id", user.id)
+      .maybeSingle()
+
+    if (profileRow?.stripe_customer_id) {
+      stripeCustomerId = profileRow.stripe_customer_id
+    } else {
+      const customer = await stripe.customers.create({
+        email: normalizedEmail,
+        name: fullName || businessName || normalizedEmail,
+        metadata: { user_id: user.id, plan },
+      })
+
+      stripeCustomerId = customer.id
+
+      await supabase
+        .from("profiles")
+        .update({ stripe_customer_id: customer.id })
+        .eq("id", user.id)
+    }
 
     // 4) Checkout session
     const baseUrl =
@@ -591,7 +649,7 @@ app.post("/api/signup", async (req, res) => {
 
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
-      customer: customer.id,
+      customer: stripeCustomerId,
       line_items: [
         { price: PRICE_IDS[plan] || PRICE_IDS.Starter, quantity: 1 },
       ],
@@ -607,6 +665,7 @@ app.post("/api/signup", async (req, res) => {
     return res.status(500).json({ error: "Signup failed" })
   }
 })
+
 
 /* ------------------------------ Login route ------------------------------- */
 
