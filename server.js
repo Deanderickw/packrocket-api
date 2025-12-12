@@ -531,25 +531,26 @@ app.post("/api/signup", async (req, res) => {
 
     const normalizedEmail = normalizeEmail(email)
 
-    // 0) Check if a Supabase auth user already exists for this email
-   const admin =
-  (supabase.auth && supabase.auth.admin) ||
-  (supabase.auth && supabase.auth.api)
+  // 0) Create auth user (Supabase v2 compatible)
+let user = null
 
-if (!admin || !admin.getUserByEmail) {
-  console.error("Supabase admin API not available. Check supabase-js version.")
-  return res.status(500).json({ error: "Supabase admin client not available" })
+const { data: authUser, error: authErr } =
+  await supabase.auth.admin.createUser({
+    email: normalizedEmail,
+    password,
+    email_confirm: true,
+  })
+
+if (authErr || !authUser?.user) {
+  console.error("Supabase createUser error:", authErr)
+  return res.status(400).json({
+    error:
+      "This email already has a PackRocket account. Try logging in or using Forgot password.",
+  })
 }
 
-const { data: existingUserData, error: existingUserErr } =
-  await admin.getUserByEmail(normalizedEmail)
+user = authUser.user
 
-    let user = existingUserData?.user || null
-
-    if (existingUserErr) {
-      console.error("getUserByEmail error:", existingUserErr)
-      // not fatal, we can still try to create user below
-    }
 
     // 1) If NO existing auth user → create one
     if (!user) {
@@ -560,15 +561,21 @@ const { data: existingUserData, error: existingUserErr } =
 })
 
 
-      if (authErr || !authUser?.user) {
-        console.error("Supabase auth error:", authErr)
-        return res.status(400).json({
-          error:
-            "We couldn't create your account with that email. Try a different email or log in instead.",
-        })
-      }
+     if (authErr) {
+  // Email already exists is the common case
+  if (authErr.message?.toLowerCase().includes("already")) {
+    return res.status(400).json({
+      error:
+        "This email already has a PackRocket account. Try logging in instead.",
+    })
+  }
 
-      user = authUser.user
+  console.error("Supabase createUser error:", authErr)
+  return res.status(500).json({ error: "Failed to create account" })
+}
+
+user = authUser.user
+
     } else {
       // We DO have an auth user already
       // Check if they already have a profile row
