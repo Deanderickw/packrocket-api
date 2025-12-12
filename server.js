@@ -552,56 +552,6 @@ if (authErr || !authUser?.user) {
 user = authUser.user
 
 
-    // 1) If NO existing auth user → create one
-    if (!user) {
-      const { data: authUser, error: authErr } = await admin.createUser({
-  email: normalizedEmail,
-  password,
-  email_confirm: true,
-})
-
-
-     if (authErr) {
-  // Email already exists is the common case
-  if (authErr.message?.toLowerCase().includes("already")) {
-    return res.status(400).json({
-      error:
-        "This email already has a PackRocket account. Try logging in instead.",
-    })
-  }
-
-  console.error("Supabase createUser error:", authErr)
-  return res.status(500).json({ error: "Failed to create account" })
-}
-
-user = authUser.user
-
-    } else {
-      // We DO have an auth user already
-      // Check if they already have a profile row
-      const { data: existingProfile, error: profileErr } = await supabase
-        .from("profiles")
-        .select("*")
-        .eq("id", user.id)
-        .maybeSingle()
-
-      if (profileErr) {
-        console.error("profiles lookup error:", profileErr)
-      }
-
-      if (existingProfile) {
-        // ✅ Auth user + profile already exist → this is NOT a new signup
-        return res.status(400).json({
-          error:
-            "This email already has a PackRocket account. Try logging in or using Forgot password.",
-        })
-      }
-
-      // ❗ Auth user exists but no profile → we'll "repair" it below by creating a fresh profile
-      console.log(
-        "No profile for existing auth user, creating a new profile row."
-      )
-    }
 
     // 2) Insert or update profile (for both new and repaired users)
     const { error: upsertErr } = await supabase.from("profiles").upsert(
@@ -663,21 +613,22 @@ user = authUser.user
     }
 
     // 4) Checkout session
-    const baseUrl =
-      process.env.PUBLIC_URL ||
-      "https://fortuitous-book-118427.framer.app"
+    const baseUrl = process.env.PUBLIC_URL || "https://packrocket.co"
 
-    const session = await stripe.checkout.sessions.create({
-      mode: "subscription",
-      customer: stripeCustomerId,
-      line_items: [
-        { price: PRICE_IDS[plan] || PRICE_IDS.Starter, quantity: 1 },
-      ],
-      success_url: `${baseUrl}/dashboard?session_id={CHECKOUT_SESSION_ID}&email=${encodeURIComponent(
-        normalizedEmail
-      )}`,
-      cancel_url: `${baseUrl}/signup?canceled=1`,
-    })
+// send them back to the plan page they started on
+const planPath =
+  plan === "Pro" ? "/pro" : plan === "Enterprise" ? "/enterprise" : "/starter"
+
+const session = await stripe.checkout.sessions.create({
+  mode: "subscription",
+  customer: stripeCustomerId,
+  line_items: [{ price: PRICE_IDS[plan] || PRICE_IDS.Starter, quantity: 1 }],
+  success_url: `${baseUrl}/dashboard?session_id={CHECKOUT_SESSION_ID}&email=${encodeURIComponent(
+    normalizedEmail
+  )}`,
+  cancel_url: `${baseUrl}${planPath}?canceled=1`,
+})
+
 
     return res.json({ url: session.url })
   } catch (err) {
