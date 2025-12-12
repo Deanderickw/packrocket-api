@@ -528,8 +528,17 @@ app.post("/api/signup", async (req, res) => {
     const normalizedEmail = normalizeEmail(email)
 
     // 0) Check if a Supabase auth user already exists for this email
-    const { data: existingUserData, error: existingUserErr } =
-      await supabase.auth.admin.getUserByEmail(normalizedEmail)
+   const admin =
+  (supabase.auth && supabase.auth.admin) ||
+  (supabase.auth && supabase.auth.api)
+
+if (!admin || !admin.getUserByEmail) {
+  console.error("Supabase admin API not available. Check supabase-js version.")
+  return res.status(500).json({ error: "Supabase admin client not available" })
+}
+
+const { data: existingUserData, error: existingUserErr } =
+  await admin.getUserByEmail(normalizedEmail)
 
     let user = existingUserData?.user || null
 
@@ -540,12 +549,12 @@ app.post("/api/signup", async (req, res) => {
 
     // 1) If NO existing auth user → create one
     if (!user) {
-      const { data: authUser, error: authErr } =
-        await supabase.auth.admin.createUser({
-          email: normalizedEmail,
-          password,
-          email_confirm: true,
-        })
+      const { data: authUser, error: authErr } = await admin.createUser({
+  email: normalizedEmail,
+  password,
+  email_confirm: true,
+})
+
 
       if (authErr || !authUser?.user) {
         console.error("Supabase auth error:", authErr)
