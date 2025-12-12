@@ -374,6 +374,10 @@ app.get("/api/_debug", (_req, res) => {
       moversTableName
     ),
     logoBucket: LOGO_BUCKET,
+    
+    // 🔍 Supabase debug
+    supabaseJsVersion: require("@supabase/supabase-js/package.json").version,
+    hasAuthAdmin: !!(supabase && supabase.auth && supabase.auth.admin),
   })
 })
 
