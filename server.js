@@ -17,7 +17,7 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
 })
 
 const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL,
+  process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 )
 
@@ -32,12 +32,12 @@ const LOGO_BUCKET = process.env.SUPABASE_LOGO_BUCKET || "logos"
 /* ------------------------- Airtable setup ------------------------- */
 
 let airtableBase = null
-if (process.env.AIRTABLE_API_KEY && process.env.AIRTABLE_BASE_ID) {
-  airtableBase = new Airtable({
-    apiKey: process.env.AIRTABLE_API_KEY,
-  }).base(process.env.AIRTABLE_BASE_ID)
+if (process.env.AIRTABLE_PAT && process.env.AIRTABLE_BASE_ID) {
+  airtableBase = new Airtable({ apiKey: process.env.AIRTABLE_PAT }).base(
+    process.env.AIRTABLE_BASE_ID
+  )
 } else {
-  console.log("⚠️ Airtable not fully configured (API key or Base ID missing)")
+  console.log("⚠️ Airtable not fully configured (PAT or Base ID missing)")
 }
 
 const moversTableName = process.env.AIRTABLE_TABLE_NAME || "Movers"
@@ -66,7 +66,6 @@ function computeProfileCompletion(profile) {
     profile.city,
     profile.state,
     profile.logo_url,
-    // optionally include starting_price if you want
   ]
 
   const filled = fields.filter((v) => v && String(v).trim() !== "").length
@@ -81,7 +80,6 @@ function formatDateLabel(isoOrMillis) {
 
   let date
   if (typeof isoOrMillis === "number") {
-    // Unix timestamp in seconds
     date = new Date(isoOrMillis * 1000)
   } else {
     date = new Date(isoOrMillis)
@@ -90,7 +88,7 @@ function formatDateLabel(isoOrMillis) {
   if (isNaN(date.getTime())) return "N/A"
 
   const options = { month: "short", day: "numeric", year: "numeric" }
-  return date.toLocaleDateString("en-US", options) // e.g. "Nov 30, 2025"
+  return date.toLocaleDateString("en-US", options)
 }
 
 // Map Supabase 'profiles' row into the Mover shape your Framer component expects
@@ -105,9 +103,9 @@ function mapProfileToMover(profileRow) {
     city: profileRow.city || "",
     state: profileRow.state || "",
     logo: profileRow.logo_url || "",
-    verified: true, // tweak later for real verification
-    rating: 4.9, // placeholder
-    jobsCompleted: 0, // placeholder
+    verified: true,
+    rating: 4.9,
+    jobsCompleted: 0,
     startingPrice:
       profileRow.starting_price !== null &&
       profileRow.starting_price !== undefined &&
@@ -125,7 +123,7 @@ async function upsertAirtableMoverFromProfile(profileRow) {
     const table = moversTable()
 
     if (
-      !process.env.AIRTABLE_API_KEY ||
+      !process.env.AIRTABLE_PAT ||
       !process.env.AIRTABLE_BASE_ID ||
       !moversTableName ||
       !table
@@ -140,6 +138,7 @@ async function upsertAirtableMoverFromProfile(profileRow) {
     }
 
     const email = normalizeEmail(profileRow.email)
+    const safeEmail = email.replace(/"/g, '\\"') // ✅ FIX: safe for Airtable formula string
     const name = profileRow.business_name || profileRow.full_name || "Mover"
 
     const phone = profileRow.phone_e164 || ""
@@ -152,7 +151,7 @@ async function upsertAirtableMoverFromProfile(profileRow) {
     // 🔍 Look up existing row by Email
     const records = await table
       .select({
-        filterByFormula: `{Email} = "${email}"`,
+        filterByFormula: `{Email} = "${safeEmail}"`, // ✅ FIX: use safeEmail
         maxRecords: 1,
       })
       .firstPage()
@@ -175,7 +174,6 @@ async function upsertAirtableMoverFromProfile(profileRow) {
     }
 
     if (records.length > 0) {
-      // ✏️ Update existing row
       await table.update([
         {
           id: records[0].id,
@@ -184,13 +182,11 @@ async function upsertAirtableMoverFromProfile(profileRow) {
       ])
       console.log("✅ Updated Airtable mover row for:", email)
     } else {
-      // ➕ Create new row
       await table.create([{ fields }])
       console.log("✅ Created Airtable mover row for:", email)
     }
   } catch (err) {
     console.error("Airtable sync failed:", err)
-    // Don’t throw – never block signup/dashboard because of Airtable
   }
 }
 
@@ -233,7 +229,6 @@ app.post(
     }
 
     try {
-      // checkout completed → activate profile
       if (event.type === "checkout.session.completed") {
         const session = event.data.object
         const customerId = session.customer
@@ -245,16 +240,11 @@ app.post(
           .single()
 
         if (user) {
-          await supabase
-            .from("profiles")
-            .update({ status: "active" })
-            .eq("id", user.id)
-
+          await supabase.from("profiles").update({ status: "active" }).eq("id", user.id)
           console.log("✅ Profile activated for customer:", customerId)
         }
       }
 
-      // subscription updates
       if (event.type === "customer.subscription.updated") {
         const sub = event.data.object
 
@@ -269,9 +259,7 @@ app.post(
             .from("profiles")
             .update({
               stripe_subscription_id: sub.id,
-              current_period_end: new Date(
-                sub.current_period_end * 1000
-              ).toISOString(),
+              current_period_end: new Date(sub.current_period_end * 1000).toISOString(),
             })
             .eq("id", user.id)
 
@@ -292,34 +280,19 @@ app.post(
 app.use(express.json()) // ✅ after webhook
 
 /* ---------------------------- Upload logo route ---------------------------- */
-/**
- * POST /api/upload-logo
- * Body: multipart/form-data with:
- *   - email (string)
- *   - file  (image)
- *
- * Returns: { ok: true, url: string }
- */
+
 app.post("/api/upload-logo", upload.single("file"), async (req, res) => {
   try {
     const rawEmail = req.body.email
     const email = normalizeEmail(rawEmail)
     const file = req.file
 
-    if (!email) {
-      return res.status(400).json({ ok: false, error: "Missing email" })
-    }
-
-    if (!file) {
-      return res.status(400).json({ ok: false, error: "Missing file" })
-    }
+    if (!email) return res.status(400).json({ ok: false, error: "Missing email" })
+    if (!file) return res.status(400).json({ ok: false, error: "Missing file" })
 
     const originalName = file.originalname || "logo.png"
-    const ext = originalName.includes(".")
-      ? originalName.split(".").pop()
-      : "png"
+    const ext = originalName.includes(".") ? originalName.split(".").pop() : "png"
 
-    // path inside the bucket (NOT including bucket name)
     const safeEmail = email.replace(/[^a-zA-Z0-9@._-]/g, "_")
     const filePath = `${safeEmail}/${Date.now()}-logo.${ext}`
 
@@ -332,9 +305,7 @@ app.post("/api/upload-logo", upload.single("file"), async (req, res) => {
 
     if (uploadError) {
       console.error("Supabase storage upload error:", uploadError)
-      return res
-        .status(500)
-        .json({ ok: false, error: "Failed to upload logo" })
+      return res.status(500).json({ ok: false, error: "Failed to upload logo" })
     }
 
     const {
@@ -342,15 +313,10 @@ app.post("/api/upload-logo", upload.single("file"), async (req, res) => {
     } = supabase.storage.from(LOGO_BUCKET).getPublicUrl(filePath)
 
     if (!publicUrl) {
-      return res
-        .status(500)
-        .json({ ok: false, error: "Could not get public logo URL" })
+      return res.status(500).json({ ok: false, error: "Could not get public logo URL" })
     }
 
-    return res.json({
-      ok: true,
-      url: publicUrl,
-    })
+    return res.json({ ok: true, url: publicUrl })
   } catch (err) {
     console.error("/api/upload-logo error:", err)
     return res.status(500).json({ ok: false, error: "Server error" })
@@ -369,13 +335,11 @@ app.get("/api/_debug", (_req, res) => {
     stripeKeyPrefix: (process.env.STRIPE_SECRET_KEY || "").slice(0, 8),
     prices: PRICE_IDS,
     airtableConfigured: !!(
-      process.env.AIRTABLE_API_KEY &&
+      process.env.AIRTABLE_PAT &&
       process.env.AIRTABLE_BASE_ID &&
       moversTableName
     ),
     logoBucket: LOGO_BUCKET,
-    
-    // 🔍 Supabase debug
     supabaseJsVersion: require("@supabase/supabase-js/package.json").version,
     hasAuthAdmin: !!(supabase && supabase.auth && supabase.auth.admin),
   })
@@ -383,23 +347,12 @@ app.get("/api/_debug", (_req, res) => {
 
 /* ------------------- Mover Dashboard route (email-only) ------------------- */
 
-// GET /api/mover-dashboard?email=...
 app.get("/api/mover-dashboard", async (req, res) => {
   try {
     const rawEmail = req.query.email
-
-    if (!rawEmail) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Missing email" })
-    }
+    if (!rawEmail) return res.status(400).json({ ok: false, error: "Missing email" })
 
     const email = normalizeEmail(rawEmail)
-
-    console.log("🔎 /api/mover-dashboard lookup", {
-      rawEmail,
-      normalizedEmail: email,
-    })
 
     const result = await supabase
       .from("profiles")
@@ -410,35 +363,18 @@ app.get("/api/mover-dashboard", async (req, res) => {
     const profile = result.data
     const error = result.error
 
-    console.log("   ↳ profile lookup result:", {
-      hasProfile: !!profile,
-      profileEmail: profile?.email,
-      error: error ? error.message || error : null,
-    })
-
     if (error) {
       console.error("Supabase profile error:", error)
-      return res
-        .status(500)
-        .json({ ok: false, error: "Profile lookup failed" })
+      return res.status(500).json({ ok: false, error: "Profile lookup failed" })
     }
 
-    if (!profile) {
-      return res
-        .status(404)
-        .json({ ok: false, error: "Profile not found" })
-    }
+    if (!profile) return res.status(404).json({ ok: false, error: "Profile not found" })
 
     const mover = mapProfileToMover(profile)
     const subscriptionTier = profile.plan || "Starter"
     const nextPaymentDate = formatDateLabel(profile.current_period_end)
 
-    return res.json({
-      ok: true,
-      mover,
-      subscriptionTier,
-      nextPaymentDate,
-    })
+    return res.json({ ok: true, mover, subscriptionTier, nextPaymentDate })
   } catch (err) {
     console.error("mover-dashboard route error:", err)
     return res.status(500).json({ ok: false, error: "Server error" })
@@ -450,7 +386,7 @@ app.get("/api/mover-dashboard", async (req, res) => {
 app.post("/api/update-profile", async (req, res) => {
   try {
     const {
-      email, // required
+      email,
       full_name,
       business_name,
       phone_e164,
@@ -460,9 +396,7 @@ app.post("/api/update-profile", async (req, res) => {
       starting_price,
     } = req.body
 
-    if (!email) {
-      return res.status(400).json({ ok: false, error: "Missing email" })
-    }
+    if (!email) return res.status(400).json({ ok: false, error: "Missing email" })
 
     const normalizedEmail = normalizeEmail(email)
 
@@ -490,21 +424,14 @@ app.post("/api/update-profile", async (req, res) => {
 
     if (error || !data) {
       console.error("update-profile supabase error:", error)
-      return res
-        .status(500)
-        .json({ ok: false, error: "Failed to update profile" })
+      return res.status(500).json({ ok: false, error: "Failed to update profile" })
     }
 
-    // ✅ Keep Airtable "Movers" row in sync with this profile
     await upsertAirtableMoverFromProfile(data)
 
     const mover = mapProfileToMover(data)
 
-    res.json({
-      ok: true,
-      mover,
-      profileCompletion: mover.profileCompletion,
-    })
+    res.json({ ok: true, mover, profileCompletion: mover.profileCompletion })
   } catch (err) {
     console.error("update-profile route error:", err)
     res.status(500).json({ ok: false, error: "Server error" })
@@ -531,29 +458,26 @@ app.post("/api/signup", async (req, res) => {
 
     const normalizedEmail = normalizeEmail(email)
 
-  // 0) Create auth user (Supabase v2 compatible)
-let user = null
+    // 0) Create auth user (Supabase v2 compatible)
+    let user = null
 
-const { data: authUser, error: authErr } =
-  await supabase.auth.admin.createUser({
-    email: normalizedEmail,
-    password,
-    email_confirm: true,
-  })
+    const { data: authUser, error: authErr } = await supabase.auth.admin.createUser({
+      email: normalizedEmail,
+      password,
+      email_confirm: true,
+    })
 
-if (authErr || !authUser?.user) {
-  console.error("Supabase createUser error:", authErr)
-  return res.status(400).json({
-    error:
-      "This email already has a PackRocket account. Try logging in or using Forgot password.",
-  })
-}
+    if (authErr || !authUser?.user) {
+      console.error("Supabase createUser error:", authErr)
+      return res.status(400).json({
+        error:
+          "This email already has a PackRocket account. Try logging in or using Forgot password.",
+      })
+    }
 
-user = authUser.user
+    user = authUser.user
 
-
-
-    // 2) Insert or update profile (for both new and repaired users)
+    // 2) Insert or update profile
     const { error: upsertErr } = await supabase.from("profiles").upsert(
       {
         id: user.id,
@@ -573,7 +497,7 @@ user = authUser.user
       return res.status(400).json({ error: upsertErr.message })
     }
 
-    // 2.5) Sync to Airtable movers table (basic fields)
+    // 2.5) Sync to Airtable movers table
     await upsertAirtableMoverFromProfile({
       id: user.id,
       email: normalizedEmail,
@@ -586,7 +510,7 @@ user = authUser.user
       plan,
     })
 
-    // 3) Stripe customer (create if missing)
+    // 3) Stripe customer
     let stripeCustomerId = null
 
     const { data: profileRow } = await supabase
@@ -614,21 +538,18 @@ user = authUser.user
 
     // 4) Checkout session
     const baseUrl = process.env.PUBLIC_URL || "https://packrocket.co"
+    const planPath =
+      plan === "Pro" ? "/pro" : plan === "Enterprise" ? "/enterprise" : "/starter"
 
-// send them back to the plan page they started on
-const planPath =
-  plan === "Pro" ? "/pro" : plan === "Enterprise" ? "/enterprise" : "/starter"
-
-const session = await stripe.checkout.sessions.create({
-  mode: "subscription",
-  customer: stripeCustomerId,
-  line_items: [{ price: PRICE_IDS[plan] || PRICE_IDS.Starter, quantity: 1 }],
-  success_url: `${baseUrl}/dashboard?session_id={CHECKOUT_SESSION_ID}&email=${encodeURIComponent(
-    normalizedEmail
-  )}`,
-  cancel_url: `${baseUrl}${planPath}?canceled=1`,
-})
-
+    const session = await stripe.checkout.sessions.create({
+      mode: "subscription",
+      customer: stripeCustomerId,
+      line_items: [{ price: PRICE_IDS[plan] || PRICE_IDS.Starter, quantity: 1 }],
+      success_url: `${baseUrl}/dashboard?session_id={CHECKOUT_SESSION_ID}&email=${encodeURIComponent(
+        normalizedEmail
+      )}`,
+      cancel_url: `${baseUrl}${planPath}?canceled=1`,
+    })
 
     return res.json({ url: session.url })
   } catch (err) {
@@ -636,7 +557,6 @@ const session = await stripe.checkout.sessions.create({
     return res.status(500).json({ error: "Signup failed" })
   }
 })
-
 
 /* ------------------------------ Login route ------------------------------- */
 
@@ -650,7 +570,6 @@ app.post("/api/login", async (req, res) => {
 
     const normalizedEmail = normalizeEmail(email)
 
-    // 1) Sign the user in
     const { data, error } = await supabase.auth.signInWithPassword({
       email: normalizedEmail,
       password,
@@ -658,18 +577,10 @@ app.post("/api/login", async (req, res) => {
 
     if (error || !data?.user) {
       console.error("Login error:", error)
-      return res.status(400).json({
-        ok: false,
-        error: "Invalid email or password",
-      })
+      return res.status(400).json({ ok: false, error: "Invalid email or password" })
     }
 
-    // 2) Success → return email + id (frontend only needs email now)
-    return res.json({
-      ok: true,
-      email: normalizedEmail,
-      userId: data.user.id,
-    })
+    return res.json({ ok: true, email: normalizedEmail, userId: data.user.id })
   } catch (err) {
     console.error("Login route error:", err)
     return res.status(500).json({ ok: false, error: "Server error" })
@@ -681,9 +592,7 @@ app.post("/api/login", async (req, res) => {
 app.get("/api/stripe/manage-billing", async (req, res) => {
   try {
     const rawEmail = req.query.email
-    if (!rawEmail) {
-      return res.status(400).json({ ok: false, error: "Missing email" })
-    }
+    if (!rawEmail) return res.status(400).json({ ok: false, error: "Missing email" })
 
     const email = normalizeEmail(rawEmail)
 
@@ -695,20 +604,14 @@ app.get("/api/stripe/manage-billing", async (req, res) => {
 
     if (error) {
       console.error("manage-billing supabase error:", error)
-      return res
-        .status(500)
-        .json({ ok: false, error: "Profile lookup failed" })
+      return res.status(500).json({ ok: false, error: "Profile lookup failed" })
     }
 
     if (!profile || !profile.stripe_customer_id) {
-      return res
-        .status(404)
-        .json({ ok: false, error: "No Stripe customer for this email" })
+      return res.status(404).json({ ok: false, error: "No Stripe customer for this email" })
     }
 
-    const baseUrl =
-      process.env.PUBLIC_URL ||
-      "https://fortuitous-book-118427.framer.app"
+    const baseUrl = process.env.PUBLIC_URL || "https://fortuitous-book-118427.framer.app"
 
     const portalSession = await stripe.billingPortal.sessions.create({
       customer: profile.stripe_customer_id,
@@ -727,10 +630,7 @@ app.get("/api/stripe/manage-billing", async (req, res) => {
 app.post("/api/stripe/cancel-subscription", async (req, res) => {
   try {
     const { email } = req.body || {}
-
-    if (!email) {
-      return res.status(400).json({ ok: false, error: "Missing email" })
-    }
+    if (!email) return res.status(400).json({ ok: false, error: "Missing email" })
 
     const normalizedEmail = normalizeEmail(email)
 
@@ -742,9 +642,7 @@ app.post("/api/stripe/cancel-subscription", async (req, res) => {
 
     if (error) {
       console.error("cancel-subscription supabase error:", error)
-      return res
-        .status(500)
-        .json({ ok: false, error: "Profile lookup failed" })
+      return res.status(500).json({ ok: false, error: "Profile lookup failed" })
     }
 
     if (!profile || !profile.stripe_subscription_id) {
@@ -754,28 +652,23 @@ app.post("/api/stripe/cancel-subscription", async (req, res) => {
       })
     }
 
-    const updatedSub = await stripe.subscriptions.update(
-      profile.stripe_subscription_id,
-      { cancel_at_period_end: true }
-    )
+    const updatedSub = await stripe.subscriptions.update(profile.stripe_subscription_id, {
+      cancel_at_period_end: true,
+    })
 
     await supabase
       .from("profiles")
       .update({
         status: "cancelling",
         stripe_subscription_id: updatedSub.id,
-        current_period_end: new Date(
-          updatedSub.current_period_end * 1000
-        ).toISOString(),
+        current_period_end: new Date(updatedSub.current_period_end * 1000).toISOString(),
       })
       .eq("id", profile.id)
 
     return res.json({
       ok: true,
       subscriptionId: updatedSub.id,
-      current_period_end: new Date(
-        updatedSub.current_period_end * 1000
-      ).toISOString(),
+      current_period_end: new Date(updatedSub.current_period_end * 1000).toISOString(),
     })
   } catch (err) {
     console.error("cancel-subscription route error:", err)
@@ -786,11 +679,7 @@ app.post("/api/stripe/cancel-subscription", async (req, res) => {
 // TEMP: debug route to see some profiles from the API's perspective
 app.get("/api/_debug-profiles", async (_req, res) => {
   try {
-    const { data, error } = await supabase
-      .from("profiles")
-      .select("id, email")
-      .limit(10)
-
+    const { data, error } = await supabase.from("profiles").select("id, email").limit(10)
     return res.json({ ok: !error, error, data })
   } catch (err) {
     console.error("_debug-profiles error:", err)
