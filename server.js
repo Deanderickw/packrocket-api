@@ -439,6 +439,7 @@ app.post("/api/update-profile", async (req, res) => {
 })
 
 /* ----------------------------- Signup route ------------------------------- */
+/* ✅ UPDATED: return clean, user-friendly messages (no "Signup did not return a Stripe URL") */
 
 app.post("/api/signup", async (req, res) => {
   try {
@@ -453,29 +454,44 @@ app.post("/api/signup", async (req, res) => {
     } = req.body
 
     if (!email || !password) {
-      return res.status(400).json({ error: "Missing required fields" })
+      return res.status(400).json({
+        ok: false,
+        code: "MISSING_FIELDS",
+        error: "Please enter an email and password.",
+      })
     }
 
     const normalizedEmail = normalizeEmail(email)
 
     // 0) Create auth user (Supabase v2 compatible)
-    let user = null
-
     const { data: authUser, error: authErr } = await supabase.auth.admin.createUser({
       email: normalizedEmail,
       password,
       email_confirm: true,
     })
 
+    // ✅ IMPORTANT: Keep behavior the same, just make message clean
     if (authErr || !authUser?.user) {
       console.error("Supabase createUser error:", authErr)
+
+      // Try to classify "email already exists" without changing flow
+      const msg = String(authErr?.message || "").toLowerCase()
+      const alreadyExists =
+        msg.includes("already") ||
+        msg.includes("exists") ||
+        msg.includes("registered") ||
+        msg.includes("duplicate")
+
       return res.status(400).json({
-        error:
-          "This email already has a PackRocket account. Try logging in or using Forgot password.",
+        ok: false,
+        code: alreadyExists ? "EMAIL_IN_USE" : "SIGNUP_FAILED",
+        error: alreadyExists
+          ? "This email already has a PackRocket account. Try logging in or using Forgot password."
+          : "We couldn’t create your account. Please try again.",
       })
     }
 
-    user = authUser.user
+    const user = authUser.user
 
     // 2) Insert or update profile
     const { error: upsertErr } = await supabase.from("profiles").upsert(
@@ -494,7 +510,11 @@ app.post("/api/signup", async (req, res) => {
 
     if (upsertErr) {
       console.error("Supabase profile upsert error:", upsertErr)
-      return res.status(400).json({ error: upsertErr.message })
+      return res.status(400).json({
+        ok: false,
+        code: "PROFILE_UPSERT_FAILED",
+        error: "We couldn’t finish setting up your account. Please try again.",
+      })
     }
 
     // 2.5) Sync to Airtable movers table
@@ -551,10 +571,24 @@ app.post("/api/signup", async (req, res) => {
       cancel_url: `${baseUrl}${planPath}?canceled=1`,
     })
 
-    return res.json({ url: session.url })
+    // ✅ UPDATED: if Stripe doesn't return a URL, return a clean message
+    if (!session?.url) {
+      console.error("Stripe checkout session missing url:", session?.id)
+      return res.status(500).json({
+        ok: false,
+        code: "STRIPE_URL_MISSING",
+        error: "We couldn’t start checkout. Please try again.",
+      })
+    }
+
+    return res.json({ ok: true, url: session.url })
   } catch (err) {
     console.error("Signup error:", err)
-    return res.status(500).json({ error: "Signup failed" })
+    return res.status(500).json({
+      ok: false,
+      code: "SIGNUP_FAILED",
+      error: "Signup failed. Please try again.",
+    })
   }
 })
 
