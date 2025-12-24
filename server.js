@@ -213,7 +213,7 @@ app.use(
 app.post(
   "/api/stripe/webhook",
   express.raw({ type: "application/json" }),
-  async (req, res) => {
+  (req, res) => {
     const sig = req.headers["stripe-signature"]
     let event
 
@@ -228,52 +228,62 @@ app.post(
       return res.status(400).send("Webhook Error")
     }
 
-    try {
-      if (event.type === "checkout.session.completed") {
-        const session = event.data.object
-        const customerId = session.customer
+    // ✅ ACK FAST (prevents Stripe timeout)
+    res.sendStatus(200)
 
-        const { data: user } = await supabase
-          .from("profiles")
-          .select("id")
-          .eq("stripe_customer_id", customerId)
-          .single()
+    // ✅ Process AFTER response
+    ;(async () => {
+      try {
+        if (event.type === "checkout.session.completed") {
+          const session = event.data.object
+          const customerId = session.customer
 
-        if (user) {
-          await supabase.from("profiles").update({ status: "active" }).eq("id", user.id)
-          console.log("✅ Profile activated for customer:", customerId)
-        }
-      }
-
-      if (event.type === "customer.subscription.updated") {
-        const sub = event.data.object
-
-        const { data: user } = await supabase
-          .from("profiles")
-          .select("id")
-          .eq("stripe_customer_id", sub.customer)
-          .single()
-
-        if (user) {
-          await supabase
+          const { data: user } = await supabase
             .from("profiles")
-            .update({
-              stripe_subscription_id: sub.id,
-              current_period_end: new Date(sub.current_period_end * 1000).toISOString(),
-            })
-            .eq("id", user.id)
+            .select("id")
+            .eq("stripe_customer_id", customerId)
+            .single()
 
-          console.log("🔄 Subscription updated for:", sub.customer)
+          if (user) {
+            await supabase
+              .from("profiles")
+              .update({ status: "active" })
+              .eq("id", user.id)
+
+            console.log("✅ Profile activated:", customerId)
+          }
         }
-      }
 
-      return res.sendStatus(200)
-    } catch (err) {
-      console.error("⚠️ Webhook handler error:", err)
-      return res.status(500).send("Server Error")
-    }
+        if (event.type === "customer.subscription.updated") {
+          const sub = event.data.object
+
+          const { data: user } = await supabase
+            .from("profiles")
+            .select("id")
+            .eq("stripe_customer_id", sub.customer)
+            .single()
+
+          if (user) {
+            await supabase
+              .from("profiles")
+              .update({
+                stripe_subscription_id: sub.id,
+                current_period_end: new Date(
+                  sub.current_period_end * 1000
+                ).toISOString(),
+              })
+              .eq("id", user.id)
+
+            console.log("🔄 Subscription updated:", sub.customer)
+          }
+        }
+      } catch (err) {
+        console.error("⚠️ Webhook async error:", err)
+      }
+    })()
   }
 )
+
 
 /* --------------------- JSON middleware for normal routes ------------------ */
 
