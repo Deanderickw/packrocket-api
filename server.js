@@ -228,61 +228,137 @@ app.post(
       return res.status(400).send("Webhook Error")
     }
 
-    // ✅ ACK FAST (prevents Stripe timeout)
+    // ✅ ACK FAST (prevents Stripe timeouts)
     res.sendStatus(200)
 
-    // ✅ Process AFTER response
+    // ✅ Process AFTER response (no manual confirmation needed)
     ;(async () => {
       try {
-        if (event.type === "checkout.session.completed") {
-          const session = event.data.object
-          const customerId = session.customer
+        const type = event.type
 
-          const { data: user } = await supabase
+        // Helper: update profile by Stripe customer id
+        const updateProfileByCustomerId = async (customerId, updates) => {
+          if (!customerId) return
+
+          const { data: user, error: findErr } = await supabase
             .from("profiles")
             .select("id")
             .eq("stripe_customer_id", customerId)
-            .single()
+            .maybeSingle()
 
-          if (user) {
-            await supabase
-              .from("profiles")
-              .update({ status: "active" })
-              .eq("id", user.id)
-
-            console.log("✅ Profile activated:", customerId)
+          if (findErr) {
+            console.error("Supabase lookup error:", findErr)
+            return
           }
+
+          if (!user?.id) return
+
+          const { error: updErr } = await supabase
+            .from("profiles")
+            .update({ ...updates, updated_at: new Date().toISOString() })
+            .eq("id", user.id)
+
+          if (updErr) console.error("Supabase update error:", updErr)
         }
 
-        if (event.type === "customer.subscription.updated") {
+        // ✅ 1) Checkout success (first payment flow)
+        if (type === "checkout.session.completed") {
+          const session = event.data.object
+          const customerId = session.customer
+          const subscriptionId = session.subscription
+
+          let currentPeriodEndISO = null
+          if (subscriptionId) {
+            const sub = await stripe.subscriptions.retrieve(subscriptionId)
+            currentPeriodEndISO = new Date(sub.current_period_end * 1000).toISOString()
+          }
+
+          await updateProfileByCustomerId(customerId, {
+            status: "active",
+            stripe_subscription_id: subscriptionId || null,
+            current_period_end: currentPeriodEndISO,
+          })
+
+          console.log("✅ checkout.session.completed → activated:", customerId)
+        }
+
+        // ✅ 2) Subscription changes (renewals, upgrades/downgrades, past_due, etc.)
+        if (type === "customer.subscription.updated") {
           const sub = event.data.object
 
-          const { data: user } = await supabase
-            .from("profiles")
-            .select("id")
-            .eq("stripe_customer_id", sub.customer)
-            .single()
-
-          if (user) {
-            await supabase
-              .from("profiles")
-              .update({
-                stripe_subscription_id: sub.id,
-                current_period_end: new Date(
-                  sub.current_period_end * 1000
-                ).toISOString(),
-              })
-              .eq("id", user.id)
-
-            console.log("🔄 Subscription updated:", sub.customer)
+          // Stripe statuses: active, trialing, past_due, canceled, unpaid, etc.
+          const statusMap = {
+            active: "active",
+            trialing: "active",
+            past_due: "past_due",
+            unpaid: "past_due",
+            canceled: "canceled",
+            incomplete: "pending",
+            incomplete_expired: "canceled",
+            paused: "paused",
           }
+
+          await updateProfileByCustomerId(sub.customer, {
+            stripe_subscription_id: sub.id,
+            status: statusMap[sub.status] || "active",
+            current_period_end: new Date(sub.current_period_end * 1000).toISOString(),
+          })
+
+          console.log("🔄 customer.subscription.updated:", sub.customer, sub.status)
+        }
+
+        // ✅ 3) Invoice paid (successful renewals)
+        if (type === "invoice.paid") {
+          const invoice = event.data.object
+          const customerId = invoice.customer
+          const subscriptionId = invoice.subscription
+
+          let currentPeriodEndISO = null
+          if (subscriptionId) {
+            const sub = await stripe.subscriptions.retrieve(subscriptionId)
+            currentPeriodEndISO = new Date(sub.current_period_end * 1000).toISOString()
+          }
+
+          await updateProfileByCustomerId(customerId, {
+            status: "active",
+            stripe_subscription_id: subscriptionId || null,
+            current_period_end: currentPeriodEndISO,
+          })
+
+          console.log("✅ invoice.paid → active:", customerId)
+        }
+
+        // ✅ 4) Payment failed (you asked about this)
+        if (type === "invoice.payment_failed") {
+          const invoice = event.data.object
+          const customerId = invoice.customer
+
+          await updateProfileByCustomerId(customerId, {
+            status: "past_due",
+          })
+
+          console.log("⚠️ invoice.payment_failed → past_due:", customerId)
+        }
+
+        // ✅ 5) Subscription canceled/deleted (you asked about this)
+        if (type === "customer.subscription.deleted") {
+          const sub = event.data.object
+
+          await updateProfileByCustomerId(sub.customer, {
+            status: "canceled",
+            stripe_subscription_id: sub.id,
+            current_period_end: new Date(sub.current_period_end * 1000).toISOString(),
+          })
+
+          console.log("🛑 customer.subscription.deleted → canceled:", sub.customer)
         }
       } catch (err) {
-        console.error("⚠️ Webhook async error:", err)
+        console.error("⚠️ Webhook async handler error:", err)
       }
     })()
   }
 )
+
 
 
 /* --------------------- JSON middleware for normal routes ------------------ */
