@@ -651,6 +651,9 @@ app.post("/api/signup", async (req, res) => {
       mode: "subscription",
       customer: stripeCustomerId,
       line_items: [{ price: PRICE_IDS[plan] || PRICE_IDS.Starter, quantity: 1 }],
+      
+      allow_promotion_codes: true,
+
       success_url: `${baseUrl}/dashboard?session_id={CHECKOUT_SESSION_ID}&email=${encodeURIComponent(
         normalizedEmail
       )}`,
