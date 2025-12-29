@@ -469,6 +469,7 @@ app.get("/api/mover-dashboard", async (req, res) => {
 
 /* -------------------------- Update profile route -------------------------- */
 
+/* -------------------------- Update profile route -------------------------- */
 
 app.post("/api/update-profile", async (req, res) => {
   try {
@@ -513,12 +514,10 @@ app.post("/api/update-profile", async (req, res) => {
 
     if (error || !data) {
       console.error("update-profile supabase error:", error)
-      return res
-        .status(500)
-        .json({ ok: false, error: "Failed to update profile" })
+      return res.status(500).json({ ok: false, error: "Failed to update profile" })
     }
 
-    // ✅ Airtable sync (NON-BLOCKING) using the updated profile row we already have
+    // ✅ Airtable sync (NON-BLOCKING) using the updated profile row
     setImmediate(() => {
       upsertAirtableMoverFromProfile(data).catch((e) =>
         console.error("Airtable async sync failed:", e)
@@ -535,15 +534,6 @@ app.post("/api/update-profile", async (req, res) => {
 
 
 
-// ✅ Airtable sync (NON-BLOCKING)
-setImmediate(() => {
-  upsertAirtableMoverFromProfile(data).catch((e) =>
-    console.error("Airtable async sync failed:", e)
-  )
-})
-
-const mover = mapProfileToMover(data)
-return res.json({ ok: true, mover, profileCompletion: mover.profileCompletion })
 
 
 
