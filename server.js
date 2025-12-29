@@ -482,7 +482,9 @@ app.post("/api/update-profile", async (req, res) => {
       starting_price,
     } = req.body
 
-    if (!email) return res.status(400).json({ ok: false, error: "Missing email" })
+    if (!email) {
+      return res.status(400).json({ ok: false, error: "Missing email" })
+    }
 
     const normalizedEmail = normalizeEmail(email)
 
@@ -510,19 +512,38 @@ app.post("/api/update-profile", async (req, res) => {
 
     if (error || !data) {
       console.error("update-profile supabase error:", error)
-      return res.status(500).json({ ok: false, error: "Failed to update profile" })
+      return res
+        .status(500)
+        .json({ ok: false, error: "Failed to update profile" })
     }
 
-    await upsertAirtableMoverFromProfile(data)
+    // ✅ Airtable sync (NON-BLOCKING) using the updated profile row
+    setImmediate(() => {
+      upsertAirtableMoverFromProfile(data).catch((e) =>
+        console.error("Airtable async sync failed:", e)
+      )
+    })
 
     const mover = mapProfileToMover(data)
-
-    res.json({ ok: true, mover, profileCompletion: mover.profileCompletion })
+    return res.json({ ok: true, mover, profileCompletion: mover.profileCompletion })
   } catch (err) {
     console.error("update-profile route error:", err)
-    res.status(500).json({ ok: false, error: "Server error" })
+    return res.status(500).json({ ok: false, error: "Server error" })
   }
 })
+
+
+// ✅ Airtable sync (NON-BLOCKING)
+setImmediate(() => {
+  upsertAirtableMoverFromProfile(data).catch((e) =>
+    console.error("Airtable async sync failed:", e)
+  )
+})
+
+const mover = mapProfileToMover(data)
+return res.json({ ok: true, mover, profileCompletion: mover.profileCompletion })
+
+
 
 /* ----------------------------- Signup route ------------------------------- */
 /* ✅ UPDATED: return clean, user-friendly messages (no "Signup did not return a Stripe URL") */
@@ -603,18 +624,22 @@ app.post("/api/signup", async (req, res) => {
       })
     }
 
-    // 2.5) Sync to Airtable movers table
-    await upsertAirtableMoverFromProfile({
-      id: user.id,
-      email: normalizedEmail,
-      full_name: fullName || "",
-      business_name: businessName || "",
-      phone_e164: phoneE164 || "",
-      city: "",
-      state: "",
-      logo_url: "",
-      plan,
-    })
+ // 2.5) Sync to Airtable movers table (NON-BLOCKING so Stripe loads faster)
+setImmediate(() => {
+  upsertAirtableMoverFromProfile({
+    id: user.id,
+    email: normalizedEmail,
+    full_name: fullName || "",
+    business_name: businessName || "",
+    phone_e164: phoneE164 || "",
+    city: "",
+    state: "",
+    logo_url: "",
+    plan,
+  }).catch((e) => console.error("Airtable async sync failed:", e))
+})
+
+
 
     // 3) Stripe customer
     let stripeCustomerId = null
