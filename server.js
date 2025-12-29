@@ -469,6 +469,7 @@ app.get("/api/mover-dashboard", async (req, res) => {
 
 /* -------------------------- Update profile route -------------------------- */
 
+
 app.post("/api/update-profile", async (req, res) => {
   try {
     const {
@@ -517,7 +518,7 @@ app.post("/api/update-profile", async (req, res) => {
         .json({ ok: false, error: "Failed to update profile" })
     }
 
-    // ✅ Airtable sync (NON-BLOCKING) using the updated profile row
+    // ✅ Airtable sync (NON-BLOCKING) using the updated profile row we already have
     setImmediate(() => {
       upsertAirtableMoverFromProfile(data).catch((e) =>
         console.error("Airtable async sync failed:", e)
@@ -531,6 +532,7 @@ app.post("/api/update-profile", async (req, res) => {
     return res.status(500).json({ ok: false, error: "Server error" })
   }
 })
+
 
 
 // ✅ Airtable sync (NON-BLOCKING)
