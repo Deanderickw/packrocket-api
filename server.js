@@ -423,14 +423,47 @@ app.get("/api/movers", async (req, res) => {
     const table = moversTable()
     if (!table) return res.status(500).json({ error: "Airtable not configured" })
 
-    // prevent Airtable formula from breaking on quotes
-    const q = qRaw.replace(/"/g, '\\"')
+    // 1) Normalize input: lowercase, remove commas, collapse spaces, escape quotes
+    const qClean = qRaw
+      .toLowerCase()
+      .replace(/,/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .replace(/"/g, '\\"')
 
-    const formula = `
-      OR(
-        SEARCH(LOWER("${q}"), LOWER({City}&" "&{State}&""))
-      )
-    `
+    // 2) Tokenize: supports "austin tx", "tx", "austin"
+    const parts = qClean.split(" ").filter(Boolean)
+    const p1 = (parts[0] || "").replace(/"/g, '\\"')
+    const p2 = (parts[1] || "").replace(/"/g, '\\"')
+
+    // Helper: Airtable-safe "contains" that won’t throw on blanks
+    // IFERROR(SEARCH("x", LOWER({Field}&"")), 0) > 0
+    const contains = (needle, fieldExpr) =>
+      `IFERROR(SEARCH("${needle}", LOWER(${fieldExpr}&"")), 0) > 0`
+
+    // 3) Build a smarter formula:
+    // - If user typed 2 tokens (city + state), match both (in any order)
+    // - Otherwise match city/state combined OR city OR state
+    let formula = ""
+
+    if (p1 && p2) {
+      formula = `
+        OR(
+          AND(${contains(p1, "{City}")}, ${contains(p2, "{State}")}),
+          AND(${contains(p2, "{City}")}, ${contains(p1, "{State}")}),
+          ${contains(qClean, "({City}&\" \"&{State})")}
+        )
+      `
+    } else {
+      formula = `
+        OR(
+          ${contains(qClean, "({City}&\" \"&{State})")},
+          ${contains(qClean, "{City}")},
+          ${contains(qClean, "{State}")},
+          ${contains(qClean, "{Name}")}
+        )
+      `
+    }
 
     const records = await table
       .select({
