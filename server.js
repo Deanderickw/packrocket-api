@@ -423,51 +423,45 @@ app.get("/api/movers", async (req, res) => {
 
     // ✅ If query isn't provided, build it from city/state
     const qRaw = queryRaw || [cityRaw, stateRaw].filter(Boolean).join(" ").trim()
-
-    // If still nothing, return empty
     if (!qRaw) return res.json({ records: [] })
 
     const table = moversTable()
     if (!table) return res.status(500).json({ error: "Airtable not configured" })
 
-    // 1) Normalize input: lowercase, remove commas, collapse spaces, escape quotes
+    // Normalize input
     const qClean = qRaw
       .toLowerCase()
       .replace(/,/g, " ")
       .replace(/\s+/g, " ")
       .trim()
-      .replace(/"/g, '\\"')
 
-    // 2) Tokenize: supports "austin tx", "tx", "austin"
     const parts = qClean.split(" ").filter(Boolean)
-    const p1 = (parts[0] || "").replace(/"/g, '\\"')
-    const p2 = (parts[1] || "").replace(/"/g, '\\"')
+    const p1 = parts[0] || ""
+    const p2 = parts[1] || ""
 
-    // Helper: Airtable-safe "contains"
+    // ✅ Escape regex special chars so user input can't break formula
+    const escapeRegex = (s) => String(s).replace(/[\\^$.*+?()[\]{}|]/g, "\\$&")
+
+    // ✅ Airtable-safe "contains" using REGEX_MATCH (no errors thrown)
     const contains = (needle, fieldExpr) =>
-      `IFERROR(SEARCH("${needle}", LOWER(${fieldExpr}&"")), 0) > 0`
+      `REGEX_MATCH(LOWER(${fieldExpr} & ""), "${escapeRegex(needle)}")`
 
-    // 3) Build formula
     let formula = ""
 
     if (p1 && p2) {
-      formula = `
-        OR(
-          AND(${contains(p1, "{City}")}, ${contains(p2, "{State}")}),
-          AND(${contains(p2, "{City}")}, ${contains(p1, "{State}")}),
-          ${contains(qClean, "({City}&\" \"&{State})")},
-          ${contains(qClean, "{Name}")}
-        )
-      `
+      formula = `OR(
+        AND(${contains(p1, "{City}")}, ${contains(p2, "{State}")}),
+        AND(${contains(p2, "{City}")}, ${contains(p1, "{State}")}),
+        ${contains(qClean, "({City} & \" \" & {State})")},
+        ${contains(qClean, "{Name}")}
+      )`
     } else {
-      formula = `
-        OR(
-          ${contains(qClean, "({City}&\" \"&{State})")},
-          ${contains(qClean, "{City}")},
-          ${contains(qClean, "{State}")},
-          ${contains(qClean, "{Name}")}
-        )
-      `
+      formula = `OR(
+        ${contains(qClean, "({City} & \" \" & {State})")},
+        ${contains(qClean, "{City}")},
+        ${contains(qClean, "{State}")},
+        ${contains(qClean, "{Name}")}
+      )`
     }
 
     const records = await table
@@ -480,9 +474,10 @@ app.get("/api/movers", async (req, res) => {
     return res.json({ records })
   } catch (err) {
     console.error("movers route error:", err)
-    return res
-      .status(500)
-      .json({ error: "Server error", details: err?.message || String(err) })
+    return res.status(500).json({
+      error: "Server error",
+      details: err?.message || String(err),
+    })
   }
 })
 
