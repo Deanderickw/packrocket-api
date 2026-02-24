@@ -413,6 +413,38 @@ app.post("/api/upload-logo", upload.single("file"), async (req, res) => {
 
 app.get("/api/health", (_req, res) => res.json({ ok: true }))
 
+/* ----------------------------- Movers search ------------------------------ */
+
+app.get("/api/movers", async (req, res) => {
+  try {
+    const q = String(req.query.query || "").trim()
+    if (!q) return res.json({ records: [] })
+
+    const table = moversTable()
+    if (!table) {
+      return res.status(500).json({ error: "Airtable not configured" })
+    }
+
+    const formula = `
+      OR(
+        SEARCH(LOWER("${q}"), LOWER({City}&" "&{State}&" "&{ZIP}&""))
+      )
+    `
+
+    const records = await table
+      .select({
+        filterByFormula: formula,
+        maxRecords: 100,
+      })
+      .firstPage()
+
+    return res.json({ records })
+  } catch (err) {
+    console.error("movers route error:", err)
+    return res.status(500).json({ error: "Server error" })
+  }
+})
+
 /* ----------------------------- Debug route -------------------------------- */
 
 app.get("/api/_debug", (_req, res) => {
@@ -466,8 +498,6 @@ app.get("/api/mover-dashboard", async (req, res) => {
     return res.status(500).json({ ok: false, error: "Server error" })
   }
 })
-
-/* -------------------------- Update profile route -------------------------- */
 
 /* -------------------------- Update profile route -------------------------- */
 
