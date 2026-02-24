@@ -417,7 +417,14 @@ app.get("/api/health", (_req, res) => res.json({ ok: true }))
 
 app.get("/api/movers", async (req, res) => {
   try {
-    const qRaw = String(req.query.query || "").trim()
+    const cityRaw = String(req.query.city || "").trim()
+    const stateRaw = String(req.query.state || "").trim()
+    const queryRaw = String(req.query.query || "").trim()
+
+    // ✅ If query isn't provided, build it from city/state
+    const qRaw = queryRaw || [cityRaw, stateRaw].filter(Boolean).join(" ").trim()
+
+    // If still nothing, return empty
     if (!qRaw) return res.json({ records: [] })
 
     const table = moversTable()
@@ -436,14 +443,11 @@ app.get("/api/movers", async (req, res) => {
     const p1 = (parts[0] || "").replace(/"/g, '\\"')
     const p2 = (parts[1] || "").replace(/"/g, '\\"')
 
-    // Helper: Airtable-safe "contains" that won’t throw on blanks
-    // IFERROR(SEARCH("x", LOWER({Field}&"")), 0) > 0
+    // Helper: Airtable-safe "contains"
     const contains = (needle, fieldExpr) =>
       `IFERROR(SEARCH("${needle}", LOWER(${fieldExpr}&"")), 0) > 0`
 
-    // 3) Build a smarter formula:
-    // - If user typed 2 tokens (city + state), match both (in any order)
-    // - Otherwise match city/state combined OR city OR state
+    // 3) Build formula
     let formula = ""
 
     if (p1 && p2) {
@@ -451,7 +455,8 @@ app.get("/api/movers", async (req, res) => {
         OR(
           AND(${contains(p1, "{City}")}, ${contains(p2, "{State}")}),
           AND(${contains(p2, "{City}")}, ${contains(p1, "{State}")}),
-          ${contains(qClean, "({City}&\" \"&{State})")}
+          ${contains(qClean, "({City}&\" \"&{State})")},
+          ${contains(qClean, "{Name}")}
         )
       `
     } else {
@@ -475,7 +480,9 @@ app.get("/api/movers", async (req, res) => {
     return res.json({ records })
   } catch (err) {
     console.error("movers route error:", err)
-    return res.status(500).json({ error: "Server error", details: err?.message || String(err) })
+    return res
+      .status(500)
+      .json({ error: "Server error", details: err?.message || String(err) })
   }
 })
 
