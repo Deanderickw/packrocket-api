@@ -417,17 +417,18 @@ app.get("/api/health", (_req, res) => res.json({ ok: true }))
 
 app.get("/api/movers", async (req, res) => {
   try {
-    const q = String(req.query.query || "").trim()
-    if (!q) return res.json({ records: [] })
+    const qRaw = String(req.query.query || "").trim()
+    if (!qRaw) return res.json({ records: [] })
 
     const table = moversTable()
-    if (!table) {
-      return res.status(500).json({ error: "Airtable not configured" })
-    }
+    if (!table) return res.status(500).json({ error: "Airtable not configured" })
+
+    // prevent Airtable formula from breaking on quotes
+    const q = qRaw.replace(/"/g, '\\"')
 
     const formula = `
       OR(
-        SEARCH(LOWER("${q}"), LOWER({City}&" "&{State}&" "&{ZIP}&""))
+        SEARCH(LOWER("${q}"), LOWER({City}&" "&{State}&""))
       )
     `
 
@@ -441,7 +442,7 @@ app.get("/api/movers", async (req, res) => {
     return res.json({ records })
   } catch (err) {
     console.error("movers route error:", err)
-    return res.status(500).json({ error: "Server error" })
+    return res.status(500).json({ error: "Server error", details: err?.message || String(err) })
   }
 })
 
