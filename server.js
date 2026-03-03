@@ -659,29 +659,37 @@ app.post("/api/signup", async (req, res) => {
     const user = authUser.user
 
     // 2) Insert or update profile
-    const { error: upsertErr } = await supabase.from("profiles").upsert(
-      {
-        id: user.id,
-        email: normalizedEmail,
-        full_name: fullName || "",
-        business_name: businessName || "",
-        phone_e164: phoneE164 || "",
-        sms_opt_in: !!smsOptIn,
-        plan,
-        status: "pending",
-      },
-      { onConflict: "id" }
-    )
+  const { error: upsertErr } = await supabase.from("profiles").upsert(
+  {
+    id: user.id,
+    email: normalizedEmail,
+    full_name: fullName || "",
+    business_name: businessName || "",
+    phone_e164: phoneE164 || "",
+    sms_opt_in: !!smsOptIn,
+    plan,
+    status: "pending",
+    approval_status: "pending", // ✅ ADD THIS LINE
+  },
+  { onConflict: "id" }
+)
 
     if (upsertErr) {
-      console.error("Supabase profile upsert error:", upsertErr)
-      return res.status(400).json({
-        ok: false,
-        code: "PROFILE_UPSERT_FAILED",
-        error: "We couldn’t finish setting up your account. Please try again.",
-      })
-    }
+  console.error("Supabase profile upsert error:", upsertErr)
 
+  // ✅ rollback auth user so they can retry signup (prevents email_exists loop)
+  try {
+    await supabase.auth.admin.deleteUser(user.id)
+  } catch (e) {
+    console.error("Rollback deleteUser failed:", e)
+  }
+
+  return res.status(400).json({
+    ok: false,
+    code: "PROFILE_UPSERT_FAILED",
+    error: "We couldn’t finish setting up your account. Please try again.",
+  })
+}
  // 2.5) Sync to Airtable movers table (NON-BLOCKING so Stripe loads faster)
 setImmediate(() => {
   upsertAirtableMoverFromProfile({
