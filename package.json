@@ -12,6 +12,7 @@
     "dotenv": "^16.6.1",
     "express": "^4.21.2",
     "multer": "^1.4.5-lts.1",
+    "resend": "^6.9.3",
     "stripe": "^19.2.0"
   },
   "keywords": [],

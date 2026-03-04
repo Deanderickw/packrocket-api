@@ -5,6 +5,7 @@ const Stripe = require("stripe")
 const { createClient } = require("@supabase/supabase-js")
 const Airtable = require("airtable")
 const multer = require("multer")
+const { Resend } = require("resend") // ✅ ADDED
 require("dotenv").config()
 
 const PORT = process.env.PORT || 5050
@@ -20,7 +21,7 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 )
-
+const resend = new Resend(process.env.RESEND_API_KEY) // ✅ ADDED
 // 🆕 Logo upload config (Supabase Storage)
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -364,6 +365,113 @@ app.post(
 /* --------------------- JSON middleware for normal routes ------------------ */
 
 app.use(express.json()) // ✅ after webhook
+/* ------------------------ Create Lead + Email Mover ------------------------ */
+/* ✅ ADDED: Booking request → save lead → email mover automatically */
+app.post("/api/leads", async (req, res) => {
+  try {
+    const {
+      moverId,
+      customerName,
+      customerPhone,
+      customerEmail,
+      moveDate,
+      pickupAddress,
+      dropoffAddress,
+      homeSize,
+      notes,
+    } = req.body || {}
+
+    if (!moverId || !customerName || !customerPhone || !moveDate) {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing required fields: moverId, customerName, customerPhone, moveDate",
+      })
+    }
+
+    // 1) Lookup mover (your movers live in 'profiles')
+    const { data: mover, error: moverErr } = await supabase
+      .from("profiles")
+      .select("id, email, business_name, full_name")
+      .eq("id", moverId)
+      .maybeSingle()
+
+    if (moverErr) {
+      console.error("Mover lookup error:", moverErr)
+      return res.status(500).json({ ok: false, error: "Mover lookup failed" })
+    }
+
+    if (!mover || !mover.email) {
+      return res.status(404).json({ ok: false, error: "Mover not found or missing email" })
+    }
+
+    const moverName = mover.business_name || mover.full_name || "Mover"
+
+    // 2) Save lead to Supabase 'leads' table (matches your schema exactly)
+    const { data: lead, error: leadErr } = await supabase
+      .from("leads")
+      .insert([
+        {
+          mover_id: moverId,
+          customer_name: customerName,
+          customer_phone: customerPhone,
+          customer_email: customerEmail || null,
+          move_date: moveDate,
+          pickup_address: pickupAddress || null,
+          dropoff_address: dropoffAddress || null,
+          home_size: homeSize || null,
+          notes: notes || null,
+          sent_status: "pending",
+        },
+      ])
+      .select("id")
+      .single()
+
+    if (leadErr || !lead?.id) {
+      console.error("Lead insert error:", leadErr)
+      return res.status(500).json({ ok: false, error: "Failed to save lead" })
+    }
+
+    // 3) Send email to mover
+    const subject = `New PackRocket Move Request — ${customerName} (${moveDate})`
+    const text =
+      `New PackRocket Move Request\n\n` +
+      `Mover: ${moverName}\n` +
+      `Customer: ${customerName}\n` +
+      `Phone: ${customerPhone}\n` +
+      (customerEmail ? `Email: ${customerEmail}\n` : "") +
+      `Move Date: ${moveDate}\n` +
+      (pickupAddress ? `Pickup: ${pickupAddress}\n` : "") +
+      (dropoffAddress ? `Dropoff: ${dropoffAddress}\n` : "") +
+      (homeSize ? `Home Size: ${homeSize}\n` : "") +
+      (notes ? `Notes: ${notes}\n` : "") +
+      `\nLead ID: ${lead.id}\n`
+
+    const emailResult = await resend.emails.send({
+      from: "PackRocket Leads <leads@packrocket.co>", // must be verified in Resend
+      to: [mover.email],
+      bcc: process.env.LEADS_BCC_EMAIL ? [process.env.LEADS_BCC_EMAIL] : undefined,
+      subject,
+      text,
+    })
+
+    // 4) Mark lead as sent
+    const { error: updErr } = await supabase
+      .from("leads")
+      .update({
+        sent_status: "sent",
+        sent_at: new Date().toISOString(),
+        email_provider_id: emailResult?.data?.id || null,
+      })
+      .eq("id", lead.id)
+
+    if (updErr) console.error("Lead status update error:", updErr)
+
+    return res.json({ ok: true, leadId: lead.id })
+  } catch (err) {
+    console.error("/api/leads error:", err)
+    return res.status(500).json({ ok: false, error: "Server error" })
+  }
+})
 
 /* ---------------------------- Upload logo route ---------------------------- */
 
