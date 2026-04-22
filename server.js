@@ -18,10 +18,18 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
   apiVersion: "2024-06-20",
 })
 
+// Admin/service-role client — admin ops, profile reads/writes, user management
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 )
+
+// Anon client — ONLY used for signInWithPassword (service role cannot authenticate users)
+const supabaseAuth = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY
+)
+
 const resend = new Resend(process.env.RESEND_API_KEY)
 
 const upload = multer({
@@ -421,7 +429,7 @@ app.post("/api/message", async (req, res) => {
     const {
       moverId,
       moverName,
-      moverEmail,
+      moverEmail: providedEmail,
       customerName,
       customerPhone,
       message,
@@ -433,26 +441,203 @@ app.post("/api/message", async (req, res) => {
       return res.status(400).json({ ok: false, error: "Missing required fields" })
     }
 
-    if (moverEmail) {
+    // Resolve mover email — use provided, or look up from Airtable by moverId
+    let moverEmail = providedEmail || ""
+    if (!moverEmail && moverId) {
+      try {
+        const table = moversTable()
+        if (table) {
+          const record = await table.find(moverId)
+          moverEmail = record?.fields?.Email || ""
+        }
+      } catch {}
+    }
+
+    if (!moverEmail) {
+      console.warn("/api/message — no mover email found for moverId:", moverId)
+      return res.json({ ok: true, note: "Message received but no email found for mover" })
+    }
+
+    await resend.emails.send({
+      from: "PackRocket <leads@packrocket.co>",
+      to: [moverEmail],
+      bcc: process.env.LEADS_BCC_EMAIL ? [process.env.LEADS_BCC_EMAIL] : undefined,
+      subject: `🚛 New message from ${customerName} via PackRocket`,
+      text:
+        `You have a new message from a customer on PackRocket!\n\n` +
+        `────────────────────────\n` +
+        `Mover: ${moverName || "N/A"}\n` +
+        `Customer: ${customerName}\n` +
+        `Phone: ${customerPhone}\n` +
+        (pickupCity ? `Pickup: ${pickupCity}\n` : "") +
+        (dropoffCity ? `Drop-off: ${dropoffCity}\n` : "") +
+        (message ? `\nMessage:\n"${message}"\n` : "") +
+        `────────────────────────\n\n` +
+        `Reply directly to this customer by calling or texting ${customerPhone}.\n\n` +
+        `– The PackRocket Team\nhttps://packrocket.co`,
+    })
+
+    console.log("✅ Message sent to mover:", moverEmail, "from customer:", customerName)
+    return res.json({ ok: true })
+  } catch (err) {
+    console.error("/api/message error:", err)
+    return res.status(500).json({ ok: false, error: "Server error" })
+  }
+})
+
+/* -------------------- Forgot password (send reset email) -------------------- */
+
+app.post("/api/forgot-password", async (req, res) => {
+  try {
+    const { email } = req.body || {}
+    if (!email) return res.status(400).json({ ok: false, error: "Missing email" })
+
+    const normalizedEmail = normalizeEmail(email)
+    const baseUrl = process.env.PUBLIC_URL || "https://packrocket.co"
+
+    // Use Supabase admin to generate a password reset link
+    const { data, error } = await supabase.auth.admin.generateLink({
+      type: "recovery",
+      email: normalizedEmail,
+      options: {
+        redirectTo: `${baseUrl}/reset-password`,
+      },
+    })
+
+    if (error) {
+      console.error("generateLink error:", error)
+      // Return ok:true even on error to prevent email enumeration
+      return res.json({ ok: true })
+    }
+
+    const resetLink = data?.properties?.action_link || data?.action_link || ""
+
+    if (resetLink) {
       await resend.emails.send({
-        from: "PackRocket <leads@packrocket.co>",
-        to: [moverEmail],
-        bcc: process.env.LEADS_BCC_EMAIL ? [process.env.LEADS_BCC_EMAIL] : undefined,
-        subject: `New message from ${customerName} via PackRocket`,
+        from: "PackRocket <noreply@packrocket.co>",
+        to: [normalizedEmail],
+        subject: "Reset your PackRocket password",
         text:
-          `New message via PackRocket\n\n` +
-          `Mover: ${moverName || "N/A"}\n` +
-          `Customer: ${customerName}\n` +
-          `Phone: ${customerPhone}\n` +
-          (pickupCity ? `Pickup: ${pickupCity}\n` : "") +
-          (dropoffCity ? `Dropoff: ${dropoffCity}\n` : "") +
-          (message ? `\nMessage: ${message}\n` : ""),
+          `Hi there,\n\n` +
+          `We received a request to reset your PackRocket password.\n\n` +
+          `Click the link below to set a new password:\n` +
+          `${resetLink}\n\n` +
+          `This link expires in 1 hour. If you didn't request a password reset, you can safely ignore this email.\n\n` +
+          `– The PackRocket Team\nhttps://packrocket.co`,
+        html:
+          `<p>Hi there,</p>` +
+          `<p>We received a request to reset your PackRocket password.</p>` +
+          `<p><a href="${resetLink}" style="display:inline-block;padding:12px 24px;background:#0084FF;color:#fff;border-radius:8px;text-decoration:none;font-weight:700;">Reset My Password</a></p>` +
+          `<p>Or copy this link: <a href="${resetLink}">${resetLink}</a></p>` +
+          `<p>This link expires in 1 hour. If you didn't request this, ignore this email.</p>` +
+          `<p>– The PackRocket Team</p>`,
       })
+      console.log("✅ Password reset email sent to:", normalizedEmail)
     }
 
     return res.json({ ok: true })
   } catch (err) {
-    console.error("/api/message error:", err)
+    console.error("/api/forgot-password error:", err)
+    // Always return ok:true to prevent email enumeration
+    return res.json({ ok: true })
+  }
+})
+
+/* -------------------- Update password (logged-in mover changes password) -------------------- */
+
+app.post("/api/update-password", async (req, res) => {
+  try {
+    const { email, currentPassword, newPassword } = req.body || {}
+
+    if (!email || !newPassword) {
+      return res.status(400).json({ ok: false, error: "Missing required fields" })
+    }
+
+    if (newPassword.length < 8) {
+      return res.status(400).json({ ok: false, error: "New password must be at least 8 characters" })
+    }
+
+    const normalizedEmail = normalizeEmail(email)
+
+    // If currentPassword provided, verify it first (must use anon client)
+    if (currentPassword) {
+      const { error: signInErr } = await supabaseAuth.auth.signInWithPassword({
+        email: normalizedEmail,
+        password: currentPassword,
+      })
+      if (signInErr) {
+        return res.status(400).json({ ok: false, error: "Current password is incorrect" })
+      }
+    }
+
+    // Look up user id
+    const { data: profile, error: profileErr } = await supabase
+      .from("profiles")
+      .select("id")
+      .eq("email", normalizedEmail)
+      .maybeSingle()
+
+    if (profileErr || !profile?.id) {
+      return res.status(404).json({ ok: false, error: "User not found" })
+    }
+
+    // Update password via admin
+    const { error: updateErr } = await supabase.auth.admin.updateUserById(
+      profile.id,
+      { password: newPassword }
+    )
+
+    if (updateErr) {
+      console.error("update-password error:", updateErr)
+      return res.status(500).json({ ok: false, error: "Failed to update password" })
+    }
+
+    console.log("✅ Password updated for:", normalizedEmail)
+    return res.json({ ok: true })
+  } catch (err) {
+    console.error("/api/update-password error:", err)
+    return res.status(500).json({ ok: false, error: "Server error" })
+  }
+})
+
+/* -------------------- Reset password via token (from email link) -------------------- */
+
+app.post("/api/reset-password", async (req, res) => {
+  try {
+    const { token, newPassword } = req.body || {}
+
+    if (!token || !newPassword) {
+      return res.status(400).json({ ok: false, error: "Missing token or new password" })
+    }
+
+    if (newPassword.length < 8) {
+      return res.status(400).json({ ok: false, error: "Password must be at least 8 characters" })
+    }
+
+    // Exchange the recovery token for a session, then update password
+    const { data: sessionData, error: sessionErr } = await supabase.auth.exchangeCodeForSession(token)
+
+    if (sessionErr || !sessionData?.user) {
+      console.error("reset-password token exchange error:", sessionErr)
+      return res.status(400).json({ ok: false, error: "Invalid or expired reset link. Please request a new one." })
+    }
+
+    const userId = sessionData.user.id
+
+    const { error: updateErr } = await supabase.auth.admin.updateUserById(
+      userId,
+      { password: newPassword }
+    )
+
+    if (updateErr) {
+      console.error("reset-password update error:", updateErr)
+      return res.status(500).json({ ok: false, error: "Failed to set new password" })
+    }
+
+    console.log("✅ Password reset complete for user:", userId)
+    return res.json({ ok: true })
+  } catch (err) {
+    console.error("/api/reset-password error:", err)
     return res.status(500).json({ ok: false, error: "Server error" })
   }
 })
@@ -707,6 +892,21 @@ app.get("/api/_debug", (_req, res) => {
   })
 })
 
+app.get("/api/_debug-stripe", (_req, res) => {
+  res.json({
+    ok: true,
+    prices: {
+      Starter: PRICE_IDS.Starter || "❌ MISSING — set STRIPE_PRICE_STARTER in Render",
+      Pro: PRICE_IDS.Pro || "❌ MISSING — set STRIPE_PRICE_PRO in Render",
+      Enterprise: PRICE_IDS.Enterprise || "❌ MISSING — set STRIPE_PRICE_ENTERPRISE in Render",
+    },
+    stripeKeyOk: !!(process.env.STRIPE_SECRET_KEY),
+    stripeKeyPrefix: (process.env.STRIPE_SECRET_KEY || "").slice(0, 12),
+    publicUrl: process.env.PUBLIC_URL || "https://packrocket.co (default)",
+    supabaseAnonKeyOk: !!(process.env.SUPABASE_ANON_KEY),
+  })
+})
+
 app.get("/api/_debug-profiles", async (_req, res) => {
   try {
     const { data, error } = await supabase.from("profiles").select("id, email").limit(10)
@@ -838,6 +1038,21 @@ app.post("/api/signup", async (req, res) => {
 
     const normalizedEmail = normalizeEmail(email)
 
+    // Pre-check: does this email already exist in profiles?
+    const { data: existingProfile } = await supabase
+      .from("profiles")
+      .select("id, email")
+      .eq("email", normalizedEmail)
+      .maybeSingle()
+
+    if (existingProfile) {
+      return res.status(400).json({
+        ok: false,
+        code: "EMAIL_IN_USE",
+        error: "An account with this email already exists. Please log in instead.",
+      })
+    }
+
     const { data: authUser, error: authErr } = await supabase.auth.admin.createUser({
       email: normalizedEmail,
       password,
@@ -933,10 +1148,20 @@ app.post("/api/signup", async (req, res) => {
     const planPath =
       plan === "Pro" ? "/pro" : plan === "Enterprise" ? "/enterprise" : "/starter"
 
+    const priceId = PRICE_IDS[plan] || PRICE_IDS.Starter
+    if (!priceId) {
+      console.error("Stripe price ID missing for plan:", plan, "PRICE_IDS:", PRICE_IDS)
+      return res.status(500).json({
+        ok: false,
+        code: "STRIPE_PRICE_MISSING",
+        error: `Stripe price ID not configured for plan: ${plan}. Please contact support.`,
+      })
+    }
+
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
       customer: stripeCustomerId,
-      line_items: [{ price: PRICE_IDS[plan] || PRICE_IDS.Starter, quantity: 1 }],
+      line_items: [{ price: priceId, quantity: 1 }],
       allow_promotion_codes: true,
       success_url: `${baseUrl}/dashboard?session_id={CHECKOUT_SESSION_ID}&email=${encodeURIComponent(normalizedEmail)}`,
       cancel_url: `${baseUrl}${planPath}?canceled=1`,
@@ -971,15 +1196,21 @@ app.post("/api/login", async (req, res) => {
       return res.status(400).json({ ok: false, error: "Missing fields" })
     }
     const normalizedEmail = normalizeEmail(email)
-    const { data, error } = await supabase.auth.signInWithPassword({
+    const { data, error } = await supabaseAuth.auth.signInWithPassword({
       email: normalizedEmail,
       password,
     })
     if (error || !data?.user) {
-      console.error("Login error:", error)
-      return res.status(400).json({ ok: false, error: "Invalid email or password" })
+      console.error("Login error:", error?.message)
+      const msg = String(error?.message || "").toLowerCase()
+      const badCreds = msg.includes("invalid") || msg.includes("credentials") || msg.includes("password") || msg.includes("not found")
+      return res.status(400).json({
+        ok: false,
+        error: badCreds ? "Incorrect email or password. Please try again." : "Login failed. Please try again.",
+      })
     }
-    return res.json({ ok: true, email: normalizedEmail, userId: data.user.id })
+    // Also store email in localStorage-friendly response
+    return res.json({ ok: true, email: normalizedEmail, userId: data.user.id, accessToken: data.session?.access_token || "" })
   } catch (err) {
     console.error("Login route error:", err)
     return res.status(500).json({ ok: false, error: "Server error" })
