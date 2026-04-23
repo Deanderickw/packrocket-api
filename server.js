@@ -24,17 +24,21 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 )
 
-// Anon client — ONLY used for signInWithPassword (service role cannot authenticate users)
-const supabaseAuth = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY
-)
+// Anon client — lazy init so missing key doesn't crash server at startup
+let _supabaseAuth = null
+function getSupabaseAuth() {
+  if (!_supabaseAuth) {
+    const key = process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY
+    _supabaseAuth = createClient(process.env.SUPABASE_URL, key)
+  }
+  return _supabaseAuth
+}
 
 const resend = new Resend(process.env.RESEND_API_KEY)
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024 }, // bumped to 5MB for hero photos
+  limits: { fileSize: 15 * 1024 * 1024 }, // 15MB to handle large phone photos
 })
 
 const LOGO_BUCKET = process.env.SUPABASE_LOGO_BUCKET || "logos"
@@ -561,7 +565,7 @@ app.post("/api/update-password", async (req, res) => {
 
     // If currentPassword provided, verify it first (must use anon client)
     if (currentPassword) {
-      const { error: signInErr } = await supabaseAuth.auth.signInWithPassword({
+      const { error: signInErr } = await getSupabaseAuth().auth.signInWithPassword({
         email: normalizedEmail,
         password: currentPassword,
       })
@@ -674,6 +678,27 @@ app.post("/api/upload-logo", upload.single("file"), async (req, res) => {
 
     if (!publicUrl) {
       return res.status(500).json({ ok: false, error: "Could not get public logo URL" })
+    }
+
+    // Update logo_url in Supabase profiles
+    await supabase.from("profiles").update({ logo_url: publicUrl }).eq("email", email)
+
+    // Sync Logo field in Airtable
+    try {
+      const table = moversTable()
+      if (table) {
+        const safeEmailQ = email.replace(/"/g, '\"')
+        const records = await table
+          .select({ filterByFormula: `{Email} = "${safeEmailQ}"`, maxRecords: 1 })
+          .firstPage()
+        if (records.length) {
+          await table.update([{ id: records[0].id, fields: { "Logo": [{ url: publicUrl }] } }])
+          console.log("✅ Updated Airtable Logo for:", email)
+        }
+      }
+    } catch (atErr) {
+      console.error("Airtable logo sync failed:", atErr)
+      // Non-fatal — still return the URL
     }
 
     return res.json({ ok: true, url: publicUrl })
@@ -857,20 +882,31 @@ app.post("/api/update-listing", async (req, res) => {
     }
 
     const fields = {}
-    if (description !== undefined) fields["Description"] = description
+    // Match exact Airtable field names
+    if (description !== undefined && description !== "") fields["Description"] = description
+    // Features = multi-select array in Airtable
     if (features !== undefined) fields["Features"] = Array.isArray(features) ? features : []
-    if (service_areas !== undefined) fields["Service Areas"] = service_areas
+    // Service Areas = text field
+    if (service_areas !== undefined && service_areas !== "") fields["Service Areas"] = service_areas
+    // Services = multi-select array in Airtable
     if (services !== undefined) fields["Services"] = Array.isArray(services) ? services : []
-    if (response_time !== undefined) fields["Response Time"] = response_time
-    if (website !== undefined) fields["Website"] = website
+    // Response Time — only set if field exists in their base (skip silently if not)
+    if (response_time !== undefined && response_time !== "") {
+      try { fields["Response Time"] = response_time } catch {}
+    }
+    // Website — only set if field exists
+    if (website !== undefined && website !== "") {
+      try { fields["Website"] = website } catch {}
+    }
 
+    console.log("📝 Updating Airtable listing for:", email, "fields:", JSON.stringify(fields))
     await table.update([{ id: records[0].id, fields }])
     console.log("✅ Updated Airtable listing fields for:", email)
 
     return res.json({ ok: true })
   } catch (err) {
-    console.error("/api/update-listing error:", err)
-    return res.status(500).json({ ok: false, error: "Server error" })
+    console.error("/api/update-listing error:", err?.message || err)
+    return res.status(500).json({ ok: false, error: err?.message || "Server error" })
   }
 })
 
@@ -1014,6 +1050,35 @@ app.post("/api/update-profile", async (req, res) => {
   }
 })
 
+/* ----------------------------- Test signup (debug only) ------------------------------- */
+
+app.get("/api/test-signup", async (_req, res) => {
+  const results = {}
+  // 1. Check Supabase admin works
+  try {
+    const { data, error } = await supabase.from("profiles").select("id").limit(1)
+    results.supabase_profiles_read = error ? `ERROR: ${error.message}` : "OK"
+  } catch (e) {
+    results.supabase_profiles_read = `EXCEPTION: ${e.message}`
+  }
+  // 2. Check Stripe
+  try {
+    const prices = { Starter: PRICE_IDS.Starter, Pro: PRICE_IDS.Pro, Enterprise: PRICE_IDS.Enterprise }
+    results.stripe_prices = prices
+    results.stripe_key_ok = !!(process.env.STRIPE_SECRET_KEY)
+  } catch (e) {
+    results.stripe = `EXCEPTION: ${e.message}`
+  }
+  // 3. Check Supabase auth admin
+  try {
+    const { data, error } = await supabase.auth.admin.listUsers({ page: 1, perPage: 1 })
+    results.supabase_auth_admin = error ? `ERROR: ${error.message}` : "OK"
+  } catch (e) {
+    results.supabase_auth_admin = `EXCEPTION: ${e.message}`
+  }
+  return res.json({ ok: true, results })
+})
+
 /* ----------------------------- Signup route ------------------------------- */
 
 app.post("/api/signup", async (req, res) => {
@@ -1088,7 +1153,7 @@ app.post("/api/signup", async (req, res) => {
         sms_opt_in: !!smsOptIn,
         plan,
         status: "pending",
-        approval_status: "pending",
+        approval_status: "pending", // must be lowercase - constraint check
       },
       { onConflict: "id" }
     )
@@ -1182,7 +1247,7 @@ app.post("/api/signup", async (req, res) => {
     return res.status(500).json({
       ok: false,
       code: "SIGNUP_FAILED",
-      error: "Signup failed. Please try again.",
+      error: `Signup failed: ${err?.message || String(err)}`,
     })
   }
 })
@@ -1196,7 +1261,7 @@ app.post("/api/login", async (req, res) => {
       return res.status(400).json({ ok: false, error: "Missing fields" })
     }
     const normalizedEmail = normalizeEmail(email)
-    const { data, error } = await supabaseAuth.auth.signInWithPassword({
+    const { data, error } = await getSupabaseAuth().auth.signInWithPassword({
       email: normalizedEmail,
       password,
     })
@@ -1303,6 +1368,27 @@ app.post("/api/stripe/cancel-subscription", async (req, res) => {
     console.error("cancel-subscription route error:", err)
     return res.status(500).json({ ok: false, error: "Server error" })
   }
+})
+
+/* ── Global error handler — catches Multer file size errors ── */
+
+app.use((err, req, res, next) => {
+  if (err && err.code === "LIMIT_FILE_SIZE") {
+    return res.status(413).json({
+      ok: false,
+      error: "File too large. Please use a photo under 15MB.",
+      code: "FILE_TOO_LARGE"
+    })
+  }
+  if (err && err.code && err.code.startsWith("LIMIT_")) {
+    return res.status(413).json({
+      ok: false,
+      error: "Upload failed: " + err.message,
+      code: err.code
+    })
+  }
+  console.error("Unhandled error:", err)
+  return res.status(500).json({ ok: false, error: "Server error" })
 })
 
 /* --------------------------------- Start ---------------------------------- */
