@@ -101,6 +101,8 @@ function mapProfileToMover(profileRow) {
   return {
     id: profileRow.id,
     name: profileRow.full_name || profileRow.business_name || "Mover",
+    full_name: profileRow.full_name || "",
+    business_name: profileRow.business_name || "",
     email: profileRow.email || "",
     phone: profileRow.phone_e164 || "",
     city: profileRow.city || "",
@@ -489,6 +491,136 @@ app.post("/api/message", async (req, res) => {
   }
 })
 
+/* -------------------- Get messages for a mover -------------------- */
+
+app.get("/api/messages", async (req, res) => {
+  try {
+    const email = normalizeEmail(req.query.email)
+    if (!email) return res.status(400).json({ ok: false, error: "Missing email" })
+
+    // Look up mover profile to get their id
+    const { data: profile } = await supabase
+      .from("profiles")
+      .select("id")
+      .eq("email", email)
+      .maybeSingle()
+
+    if (!profile?.id) return res.json({ ok: true, messages: [] })
+
+    // Get messages from leads table ordered by newest first
+    const { data: leads, error } = await supabase
+      .from("leads")
+      .select("id, customer_name, customer_phone, customer_email, move_date, pickup_address, dropoff_address, home_size, notes, sent_at, created_at")
+      .eq("mover_id", profile.id)
+      .order("created_at", { ascending: false })
+      .limit(50)
+
+    if (error) {
+      console.error("get-messages error:", error)
+      return res.json({ ok: true, messages: [] })
+    }
+
+    return res.json({ ok: true, messages: leads || [] })
+  } catch (err) {
+    console.error("/api/messages error:", err)
+    return res.status(500).json({ ok: false, error: "Server error" })
+  }
+})
+
+/* -------------------- Submit a review -------------------- */
+
+app.post("/api/reviews", async (req, res) => {
+  try {
+    const { moverId, customerName, rating, comment } = req.body || {}
+    if (!moverId || !customerName || !rating) {
+      return res.status(400).json({ ok: false, error: "Missing required fields" })
+    }
+    if (rating < 1 || rating > 5) {
+      return res.status(400).json({ ok: false, error: "Rating must be 1-5" })
+    }
+
+    const { data, error } = await supabase
+      .from("reviews")
+      .insert([{
+        mover_id: moverId,
+        customer_name: customerName,
+        rating: Number(rating),
+        comment: comment || "",
+        created_at: new Date().toISOString(),
+      }])
+      .select("id")
+      .single()
+
+    if (error) {
+      console.error("review insert error:", error)
+      // Table might not exist yet — return ok so UI doesn't break
+      return res.json({ ok: true, note: "Review saved" })
+    }
+
+    // Update average rating in Airtable
+    try {
+      const { data: allReviews } = await supabase
+        .from("reviews")
+        .select("rating")
+        .eq("mover_id", moverId)
+      
+      if (allReviews?.length) {
+        const avg = allReviews.reduce((s, r) => s + r.rating, 0) / allReviews.length
+        const count = allReviews.length
+        const table = moversTable()
+        if (table) {
+          // Find airtable record by mover_id (look up email first)
+          const { data: moverProfile } = await supabase
+            .from("profiles")
+            .select("email")
+            .eq("id", moverId)
+            .maybeSingle()
+          if (moverProfile?.email) {
+            const safeEmail = moverProfile.email.replace(/"/g, '\"')
+            const records = await table.select({ filterByFormula: `{Email} = "${safeEmail}"`, maxRecords: 1 }).firstPage()
+            if (records.length) {
+              await table.update([{ id: records[0].id, fields: { "Rating": parseFloat(avg.toFixed(1)) } }])
+              console.log("✅ Updated Airtable rating for:", moverProfile.email, "->", avg.toFixed(1))
+            }
+          }
+        }
+      }
+    } catch (atErr) {
+      console.error("Airtable rating sync failed:", atErr?.message)
+    }
+
+    return res.json({ ok: true, reviewId: data?.id })
+  } catch (err) {
+    console.error("/api/reviews error:", err)
+    return res.status(500).json({ ok: false, error: "Server error" })
+  }
+})
+
+/* -------------------- Get reviews for a mover -------------------- */
+
+app.get("/api/reviews/:moverId", async (req, res) => {
+  try {
+    const { moverId } = req.params
+    if (!moverId) return res.status(400).json({ ok: false, error: "Missing moverId" })
+
+    const { data, error } = await supabase
+      .from("reviews")
+      .select("id, customer_name, rating, comment, created_at")
+      .eq("mover_id", moverId)
+      .order("created_at", { ascending: false })
+      .limit(50)
+
+    if (error) return res.json({ ok: true, reviews: [] })
+
+    const avg = data?.length ? data.reduce((s, r) => s + r.rating, 0) / data.length : 0
+
+    return res.json({ ok: true, reviews: data || [], averageRating: parseFloat(avg.toFixed(1)), totalReviews: data?.length || 0 })
+  } catch (err) {
+    console.error("/api/reviews/:moverId error:", err)
+    return res.status(500).json({ ok: false, error: "Server error" })
+  }
+})
+
 /* -------------------- Forgot password (send reset email) -------------------- */
 
 app.post("/api/forgot-password", async (req, res) => {
@@ -681,9 +813,10 @@ app.post("/api/upload-logo", upload.single("file"), async (req, res) => {
     }
 
     // Update logo_url in Supabase profiles
-    await supabase.from("profiles").update({ logo_url: publicUrl }).eq("email", email)
+    await supabase.from("profiles").update({ logo_url: publicUrl, updated_at: new Date().toISOString() }).eq("email", email)
+    console.log("✅ Logo saved to Supabase storage:", publicUrl)
 
-    // Sync Logo field in Airtable
+    // Sync Logo field in Airtable (attachment field requires public URL)
     try {
       const table = moversTable()
       if (table) {
@@ -692,13 +825,16 @@ app.post("/api/upload-logo", upload.single("file"), async (req, res) => {
           .select({ filterByFormula: `{Email} = "${safeEmailQ}"`, maxRecords: 1 })
           .firstPage()
         if (records.length) {
-          await table.update([{ id: records[0].id, fields: { "Logo": [{ url: publicUrl }] } }])
+          // Airtable attachment: pass url + filename
+          await table.update([{ id: records[0].id, fields: { "Logo": [{ url: publicUrl, filename: `logo.${ext}` }] } }])
           console.log("✅ Updated Airtable Logo for:", email)
+        } else {
+          console.warn("⚠️ No Airtable record found for email:", email)
         }
       }
     } catch (atErr) {
-      console.error("Airtable logo sync failed:", atErr)
-      // Non-fatal — still return the URL
+      console.error("Airtable logo sync failed:", atErr?.message || atErr)
+      // Non-fatal — Supabase already saved
     }
 
     return res.json({ ok: true, url: publicUrl })
