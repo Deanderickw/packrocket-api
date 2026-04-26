@@ -350,48 +350,83 @@ app.post("/api/leads", async (req, res) => {
       })
     }
 
-    const { data: mover, error: moverErr } = await supabase
+    // moverId may be a Supabase UUID or an Airtable record ID
+    // Try Supabase UUID lookup first, then fall back to Airtable
+    let moverEmail = ""
+    let moverDisplayName = "Mover"
+    let supabaseMoverId = null
+
+    const { data: supabaseMover } = await supabase
       .from("profiles")
       .select("id, email, business_name, full_name")
       .eq("id", moverId)
       .maybeSingle()
 
-    if (moverErr) {
-      console.error("Mover lookup error:", moverErr)
-      return res.status(500).json({ ok: false, error: "Mover lookup failed" })
+    if (supabaseMover?.email) {
+      moverEmail = supabaseMover.email
+      moverDisplayName = supabaseMover.business_name || supabaseMover.full_name || "Mover"
+      supabaseMoverId = supabaseMover.id
+    } else {
+      // Try Airtable — moverId is likely an Airtable record ID
+      try {
+        const table = moversTable()
+        if (table) {
+          const record = await table.find(moverId)
+          const atEmail = record?.fields?.Email || ""
+          if (atEmail) {
+            moverEmail = atEmail
+            moverDisplayName = String(record?.fields?.Name || "Mover")
+            // Look up their Supabase profile by email
+            const { data: profileByEmail } = await supabase
+              .from("profiles")
+              .select("id, email, business_name, full_name")
+              .ilike("email", atEmail)
+              .maybeSingle()
+            if (profileByEmail) {
+              supabaseMoverId = profileByEmail.id
+              moverDisplayName = profileByEmail.business_name || profileByEmail.full_name || moverDisplayName
+            }
+          }
+        }
+      } catch (atErr) {
+        console.error("Airtable mover lookup error:", atErr?.message)
+      }
     }
-    if (!mover || !mover.email) {
+
+    if (!moverEmail) {
       return res.status(404).json({ ok: false, error: "Mover not found or missing email" })
     }
 
-    const moverName = mover.business_name || mover.full_name || "Mover"
-
-    const { data: lead, error: leadErr } = await supabase
-      .from("leads")
-      .insert([{
-        mover_id: moverId,
-        customer_name: customerName,
-        customer_phone: customerPhone,
-        customer_email: customerEmail || null,
-        move_date: moveDate,
-        pickup_address: pickupAddress || null,
-        dropoff_address: dropoffAddress || null,
-        home_size: homeSize || null,
-        notes: notes || null,
-        sent_status: "pending",
-      }])
-      .select("id")
-      .single()
-
-    if (leadErr || !lead?.id) {
-      console.error("Lead insert error:", leadErr)
-      return res.status(500).json({ ok: false, error: "Failed to save lead" })
+    // Save lead to Supabase if we have a valid profile ID
+    let leadId = null
+    if (supabaseMoverId) {
+      const { data: leadRow, error: leadErr } = await supabase
+        .from("leads")
+        .insert([{
+          mover_id: supabaseMoverId,
+          customer_name: customerName,
+          customer_phone: customerPhone,
+          customer_email: customerEmail || null,
+          move_date: moveDate,
+          pickup_address: pickupAddress || null,
+          dropoff_address: dropoffAddress || null,
+          home_size: homeSize || null,
+          notes: notes || null,
+          sent_status: "pending",
+        }])
+        .select("id")
+        .single()
+      if (leadErr) console.error("Lead insert error:", leadErr?.message)
+      else leadId = leadRow?.id
+    } else {
+      console.warn("⚠️ No Supabase profile found for mover — lead not saved to DB, email only")
     }
 
+    // Send email to mover
     const subject = `New PackRocket Move Request — ${customerName} (${moveDate})`
     const text =
       `New PackRocket Move Request\n\n` +
-      `Mover: ${moverName}\n` +
+      `Mover: ${moverDisplayName}\n` +
       `Customer: ${customerName}\n` +
       `Phone: ${customerPhone}\n` +
       (customerEmail ? `Email: ${customerEmail}\n` : "") +
@@ -400,28 +435,28 @@ app.post("/api/leads", async (req, res) => {
       (dropoffAddress ? `Dropoff: ${dropoffAddress}\n` : "") +
       (homeSize ? `Home Size: ${homeSize}\n` : "") +
       (notes ? `Notes: ${notes}\n` : "") +
-      `\nLead ID: ${lead.id}\n`
+      (leadId ? `\nLead ID: ${leadId}\n` : "")
 
     const emailResult = await resend.emails.send({
       from: "PackRocket Leads <leads@packrocket.co>",
-      to: [mover.email],
+      to: [moverEmail],
       bcc: process.env.LEADS_BCC_EMAIL ? [process.env.LEADS_BCC_EMAIL] : undefined,
       subject,
       text,
     })
 
-    const { error: updErr } = await supabase
-      .from("leads")
-      .update({
+    console.log("✅ Move request sent to:", moverEmail, "from:", customerName)
+
+    // Update lead status
+    if (leadId) {
+      await supabase.from("leads").update({
         sent_status: "sent",
         sent_at: new Date().toISOString(),
         email_provider_id: emailResult?.data?.id || null,
-      })
-      .eq("id", lead.id)
+      }).eq("id", leadId)
+    }
 
-    if (updErr) console.error("Lead status update error:", updErr)
-
-    return res.json({ ok: true, leadId: lead.id })
+    return res.json({ ok: true, leadId })
   } catch (err) {
     console.error("/api/leads error:", err)
     return res.status(500).json({ ok: false, error: "Server error" })
