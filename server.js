@@ -484,6 +484,46 @@ app.post("/api/message", async (req, res) => {
     })
 
     console.log("✅ Message sent to mover:", moverEmail, "from customer:", customerName)
+
+    // Save to leads table so it shows in dashboard
+    // moverId here is an Airtable record ID — look up the Supabase profile id by email
+    try {
+      let supabaseMoverId = null
+      if (moverEmail) {
+        const { data: moverProfile } = await supabase
+          .from("profiles")
+          .select("id")
+          .ilike("email", moverEmail)
+          .maybeSingle()
+        supabaseMoverId = moverProfile?.id || null
+      }
+      if (supabaseMoverId) {
+        const { error: leadInsertErr } = await supabase.from("leads").insert([{
+          mover_id: supabaseMoverId,
+          customer_name: customerName,
+          customer_phone: customerPhone,
+          customer_email: null,
+          move_date: null,
+          pickup_address: pickupCity || null,
+          dropoff_address: dropoffCity || null,
+          home_size: null,
+          notes: message || null,
+          sent_status: "sent",
+          sent_at: new Date().toISOString(),
+          created_at: new Date().toISOString(),
+        }])
+        if (leadInsertErr) {
+          console.error("❌ Lead insert failed:", leadInsertErr.message, leadInsertErr.code, leadInsertErr.details)
+        } else {
+          console.log("✅ Lead saved to Supabase for mover:", moverEmail, "mover_id:", supabaseMoverId)
+        }
+      } else {
+        console.warn("⚠️ Could not find Supabase profile for mover email:", moverEmail, "— lead NOT saved")
+      }
+    } catch (leadErr) {
+      console.error("Lead save error (non-fatal):", leadErr?.message, leadErr)
+    }
+
     return res.json({ ok: true })
   } catch (err) {
     console.error("/api/message error:", err)
@@ -553,8 +593,7 @@ app.post("/api/reviews", async (req, res) => {
 
     if (error) {
       console.error("review insert error:", error)
-      // Table might not exist yet — return ok so UI doesn't break
-      return res.json({ ok: true, note: "Review saved" })
+      return res.status(500).json({ ok: false, error: error.message || "Failed to save review. Make sure the reviews table exists in Supabase." })
     }
 
     // Update average rating in Airtable
@@ -580,7 +619,7 @@ app.post("/api/reviews", async (req, res) => {
             const records = await table.select({ filterByFormula: `{Email} = "${safeEmail}"`, maxRecords: 1 }).firstPage()
             if (records.length) {
               await table.update([{ id: records[0].id, fields: { "Rating": parseFloat(avg.toFixed(1)) } }])
-              console.log("✅ Updated Airtable rating for:", moverProfile.email, "->", avg.toFixed(1))
+              console.log("✅ Updated Airtable rating for:", moverProfile.email, "->", avg.toFixed(1), "count:", count)
             }
           }
         }
