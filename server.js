@@ -503,7 +503,7 @@ app.post("/api/message", async (req, res) => {
           customer_name: customerName,
           customer_phone: customerPhone,
           customer_email: null,
-          move_date: "Not specified",
+          move_date: null,
           pickup_address: pickupCity || null,
           dropoff_address: dropoffCity || null,
           home_size: null,
