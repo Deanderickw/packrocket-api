@@ -1079,6 +1079,79 @@ app.get("/api/movers/by-email", async (req, res) => {
   }
 })
 
+/* ── Check mover availability (Free plan limit) ── */
+
+app.get("/api/movers/:id/availability", async (req, res) => {
+  try {
+    const { id } = req.params
+    if (!id) return res.status(400).json({ ok: false, error: "Missing id" })
+
+    // Try Supabase first
+    const { data: profile } = await supabase
+      .from("profiles")
+      .select("id, plan")
+      .eq("id", id)
+      .maybeSingle()
+
+    let supabaseMoverId = profile?.id || null
+    let moverPlan = profile?.plan || "Free"
+
+    // Fall back to Airtable lookup by record ID
+    if (!supabaseMoverId) {
+      try {
+        const table = moversTable()
+        if (table) {
+          const record = await table.find(id)
+          const atEmail = record?.fields?.Email || ""
+          if (atEmail) {
+            const { data: profileByEmail } = await supabase
+              .from("profiles")
+              .select("id, plan")
+              .ilike("email", atEmail)
+              .maybeSingle()
+            if (profileByEmail) {
+              supabaseMoverId = profileByEmail.id
+              moverPlan = profileByEmail.plan || "Free"
+            }
+          }
+        }
+      } catch {}
+    }
+
+    // Pro/Enterprise: always available
+    if (moverPlan !== "Free") {
+      return res.json({ ok: true, available: true })
+    }
+
+    // Free plan: check this month's lead count
+    if (!supabaseMoverId) {
+      return res.json({ ok: true, available: true })
+    }
+
+    const now = new Date()
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString()
+    const monthEnd = new Date(now.getFullYear(), now.getMonth() + 1, 1).toISOString()
+
+    const { count, error: countErr } = await supabase
+      .from("leads")
+      .select("id", { count: "exact", head: true })
+      .eq("mover_id", supabaseMoverId)
+      .gte("created_at", monthStart)
+      .lt("created_at", monthEnd)
+
+    if (countErr) {
+      console.error("availability count error:", countErr)
+      return res.json({ ok: true, available: true })
+    }
+
+    const available = count < 1
+    return res.json({ ok: true, available, plan: moverPlan })
+  } catch (err) {
+    console.error("/api/movers/:id/availability error:", err)
+    return res.json({ ok: true, available: true })
+  }
+})
+
 /* ── Single mover by Airtable record ID ── */
 
 app.get("/api/movers/:id", async (req, res) => {
