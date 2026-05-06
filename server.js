@@ -48,7 +48,6 @@ if (process.env.AIRTABLE_PAT && process.env.AIRTABLE_BASE_ID) {
   airtableBase = new Airtable({ apiKey: process.env.AIRTABLE_PAT }).base(
     process.env.AIRTABLE_BASE_ID
   )
-  console.log("✅ Airtable configured — base:", process.env.AIRTABLE_BASE_ID)
 } else {
   console.log("⚠️ Airtable not fully configured (PAT or Base ID missing)")
 }
@@ -120,14 +119,10 @@ function mapProfileToMover(profileRow) {
         : undefined,
     features: [],
     profileCompletion: computeProfileCompletion(profileRow),
-    plan: profileRow.plan || "Free",
-    status: profileRow.status || "pending",
   }
 }
 
-// ── FIX: now accepts optional retries, logs every step clearly ──
-async function upsertAirtableMoverFromProfile(profileRow, { retries = 2 } = {}) {
-  const tag = `[Airtable sync: ${profileRow?.email || "unknown"}]`
+async function upsertAirtableMoverFromProfile(profileRow) {
   try {
     const table = moversTable()
     if (
@@ -136,14 +131,13 @@ async function upsertAirtableMoverFromProfile(profileRow, { retries = 2 } = {}) 
       !moversTableName ||
       !table
     ) {
-      console.warn(`${tag} ⚠️ Airtable env not configured — skipping`)
-      return { ok: false, reason: "not_configured" }
+      console.log("Airtable env not fully set or table missing, skipping sync")
+      return
     }
     if (!profileRow || !profileRow.email) {
-      console.warn(`${tag} ⚠️ No email on profileRow — skipping`)
-      return { ok: false, reason: "no_email" }
+      console.log("No profileRow or email passed to upsertAirtableMoverFromProfile")
+      return
     }
-
     const email = normalizeEmail(profileRow.email)
     const safeEmail = email.replace(/"/g, '\\"')
     const name = profileRow.business_name || profileRow.full_name || "Mover"
@@ -155,7 +149,6 @@ async function upsertAirtableMoverFromProfile(profileRow, { retries = 2 } = {}) 
     const plan = profileRow.plan || "Free"
     const startingPrice = profileRow.starting_price || null
 
-    console.log(`${tag} Searching Airtable for existing record…`)
     const records = await table
       .select({
         filterByFormula: `{Email} = "${safeEmail}"`,
@@ -173,27 +166,22 @@ async function upsertAirtableMoverFromProfile(profileRow, { retries = 2 } = {}) 
       Plan: plan,
     }
 
-    if (logoUrl) fields.Logo = [{ url: logoUrl }]
-    if (startingPrice !== null) fields["Starting price"] = startingPrice
+    if (logoUrl) {
+      fields.Logo = [{ url: logoUrl }]
+    }
+    if (startingPrice !== null) {
+      fields["Starting price"] = startingPrice
+    }
 
     if (records.length > 0) {
       await table.update([{ id: records[0].id, fields }])
-      console.log(`${tag} ✅ Updated existing Airtable record (id: ${records[0].id})`)
+      console.log("✅ Updated Airtable mover row for:", email)
     } else {
-      const created = await table.create([{ fields }])
-      console.log(`${tag} ✅ Created new Airtable record (id: ${created[0]?.id})`)
+      await table.create([{ fields }])
+      console.log("✅ Created Airtable mover row for:", email)
     }
-    return { ok: true }
   } catch (err) {
-    console.error(`${tag} ❌ Airtable sync failed:`, err?.message || err)
-    // Retry on transient errors
-    if (retries > 0) {
-      const delay = (3 - retries) * 1500
-      console.log(`${tag} Retrying in ${delay}ms… (${retries} left)`)
-      await new Promise((r) => setTimeout(r, delay))
-      return upsertAirtableMoverFromProfile(profileRow, { retries: retries - 1 })
-    }
-    return { ok: false, reason: err?.message }
+    console.error("Airtable sync failed:", err)
   }
 }
 
@@ -366,10 +354,11 @@ app.post("/api/leads", async (req, res) => {
     let moverEmail = ""
     let moverDisplayName = "Mover"
     let supabaseMoverId = null
+    let moverPlan = "Free"
 
     const { data: supabaseMover } = await supabase
       .from("profiles")
-      .select("id, email, business_name, full_name")
+      .select("id, email, business_name, full_name, plan")
       .eq("id", moverId)
       .maybeSingle()
 
@@ -377,6 +366,7 @@ app.post("/api/leads", async (req, res) => {
       moverEmail = supabaseMover.email
       moverDisplayName = supabaseMover.business_name || supabaseMover.full_name || "Mover"
       supabaseMoverId = supabaseMover.id
+      moverPlan = supabaseMover.plan || "Free"
     } else {
       try {
         const table = moversTable()
@@ -388,12 +378,13 @@ app.post("/api/leads", async (req, res) => {
             moverDisplayName = String(record?.fields?.Name || "Mover")
             const { data: profileByEmail } = await supabase
               .from("profiles")
-              .select("id, email, business_name, full_name")
+              .select("id, email, business_name, full_name, plan")
               .ilike("email", atEmail)
               .maybeSingle()
             if (profileByEmail) {
               supabaseMoverId = profileByEmail.id
               moverDisplayName = profileByEmail.business_name || profileByEmail.full_name || moverDisplayName
+              moverPlan = profileByEmail.plan || "Free"
             }
           }
         }
@@ -404,6 +395,31 @@ app.post("/api/leads", async (req, res) => {
 
     if (!moverEmail) {
       return res.status(404).json({ ok: false, error: "Mover not found or missing email" })
+    }
+
+    // ── Free plan: enforce 1 lead per calendar month ──
+    if (moverPlan === "Free" && supabaseMoverId) {
+      const now = new Date()
+      const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString()
+      const monthEnd = new Date(now.getFullYear(), now.getMonth() + 1, 1).toISOString()
+
+      const { count, error: countErr } = await supabase
+        .from("leads")
+        .select("id", { count: "exact", head: true })
+        .eq("mover_id", supabaseMoverId)
+        .gte("created_at", monthStart)
+        .lt("created_at", monthEnd)
+
+      if (countErr) {
+        console.error("Free plan lead count error:", countErr)
+      } else if (count >= 1) {
+        console.log(`⛔ Free plan limit reached for mover: ${moverEmail} (${count} leads this month)`)
+        return res.status(403).json({
+          ok: false,
+          code: "FREE_PLAN_LIMIT",
+          error: "This mover isn't available right now. Try contacting another mover.",
+        })
+      }
     }
 
     let leadId = null
@@ -502,6 +518,45 @@ app.post("/api/message", async (req, res) => {
     if (!moverEmail) {
       console.warn("/api/message — no mover email found for moverId:", moverId)
       return res.json({ ok: true, note: "Message received but no email found for mover" })
+    }
+
+    // ── Free plan: enforce 1 message per calendar month ──
+    let messageMoverPlan = "Free"
+    let messageSupabaseMoverId = null
+    if (moverEmail) {
+      const { data: moverProfile } = await supabase
+        .from("profiles")
+        .select("id, plan")
+        .ilike("email", moverEmail)
+        .maybeSingle()
+      if (moverProfile) {
+        messageMoverPlan = moverProfile.plan || "Free"
+        messageSupabaseMoverId = moverProfile.id
+      }
+    }
+
+    if (messageMoverPlan === "Free" && messageSupabaseMoverId) {
+      const now = new Date()
+      const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString()
+      const monthEnd = new Date(now.getFullYear(), now.getMonth() + 1, 1).toISOString()
+
+      const { count, error: countErr } = await supabase
+        .from("leads")
+        .select("id", { count: "exact", head: true })
+        .eq("mover_id", messageSupabaseMoverId)
+        .gte("created_at", monthStart)
+        .lt("created_at", monthEnd)
+
+      if (countErr) {
+        console.error("Free plan message count error:", countErr)
+      } else if (count >= 1) {
+        console.log(`⛔ Free plan message limit reached for mover: ${moverEmail} (${count} messages this month)`)
+        return res.status(403).json({
+          ok: false,
+          code: "FREE_PLAN_LIMIT",
+          error: "This mover isn't available right now. Try contacting another mover.",
+        })
+      }
     }
 
     await resend.emails.send({
@@ -629,7 +684,7 @@ app.post("/api/reviews", async (req, res) => {
 
     if (error) {
       console.error("review insert error:", error)
-      return res.status(500).json({ ok: false, error: error.message || "Failed to save review." })
+      return res.status(500).json({ ok: false, error: error.message || "Failed to save review. Make sure the reviews table exists in Supabase." })
     }
 
     try {
@@ -1099,7 +1154,6 @@ app.get("/api/_debug", (_req, res) => {
       process.env.AIRTABLE_BASE_ID &&
       moversTableName
     ),
-    airtableTable: moversTableName,
     logoBucket: LOGO_BUCKET,
     supabaseJsVersion: require("@supabase/supabase-js/package.json").version,
     hasAuthAdmin: !!(supabase && supabase.auth && supabase.auth.admin),
@@ -1128,29 +1182,6 @@ app.get("/api/_debug-profiles", async (_req, res) => {
   } catch (err) {
     console.error("_debug-profiles error:", err)
     return res.status(500).json({ ok: false, error: "Server error" })
-  }
-})
-
-/* ── NEW: debug route to manually trigger Airtable sync for an email ── */
-app.get("/api/_debug-airtable-sync", async (req, res) => {
-  try {
-    const email = normalizeEmail(req.query.email)
-    if (!email) return res.status(400).json({ ok: false, error: "Missing ?email=" })
-
-    const { data: profile, error } = await supabase
-      .from("profiles")
-      .select("*")
-      .eq("email", email)
-      .maybeSingle()
-
-    if (error || !profile) {
-      return res.status(404).json({ ok: false, error: "Profile not found in Supabase", detail: error?.message })
-    }
-
-    const result = await upsertAirtableMoverFromProfile(profile)
-    return res.json({ ok: result.ok, profile, airtableResult: result })
-  } catch (err) {
-    return res.status(500).json({ ok: false, error: err?.message })
   }
 })
 
@@ -1253,6 +1284,32 @@ app.post("/api/update-profile", async (req, res) => {
   }
 })
 
+/* ----------------------------- Test signup (debug only) ------------------------------- */
+
+app.get("/api/test-signup", async (_req, res) => {
+  const results = {}
+  try {
+    const { data, error } = await supabase.from("profiles").select("id").limit(1)
+    results.supabase_profiles_read = error ? `ERROR: ${error.message}` : "OK"
+  } catch (e) {
+    results.supabase_profiles_read = `EXCEPTION: ${e.message}`
+  }
+  try {
+    const prices = { Free: "No Stripe price — handled on site", Pro: PRICE_IDS.Pro, Enterprise: PRICE_IDS.Enterprise }
+    results.stripe_prices = prices
+    results.stripe_key_ok = !!(process.env.STRIPE_SECRET_KEY)
+  } catch (e) {
+    results.stripe = `EXCEPTION: ${e.message}`
+  }
+  try {
+    const { data, error } = await supabase.auth.admin.listUsers({ page: 1, perPage: 1 })
+    results.supabase_auth_admin = error ? `ERROR: ${error.message}` : "OK"
+  } catch (e) {
+    results.supabase_auth_admin = `EXCEPTION: ${e.message}`
+  }
+  return res.json({ ok: true, results })
+})
+
 /* ----------------------------- Signup route ------------------------------- */
 
 app.post("/api/signup", async (req, res) => {
@@ -1277,7 +1334,6 @@ app.post("/api/signup", async (req, res) => {
     }
 
     const normalizedEmail = normalizeEmail(email)
-    console.log(`[signup] Starting for: ${normalizedEmail}, plan: ${plan}`)
 
     const { data: existingProfile } = await supabase
       .from("profiles")
@@ -1317,7 +1373,6 @@ app.post("/api/signup", async (req, res) => {
     }
 
     const user = authUser.user
-    console.log(`[signup] Auth user created: ${user.id}`)
 
     const { error: upsertErr } = await supabase.from("profiles").upsert(
       {
@@ -1349,46 +1404,27 @@ app.post("/api/signup", async (req, res) => {
       })
     }
 
-    console.log(`[signup] Supabase profile upserted for: ${normalizedEmail}`)
+    setImmediate(() => {
+      upsertAirtableMoverFromProfile({
+        id: user.id,
+        email: normalizedEmail,
+        full_name: fullName || "",
+        business_name: businessName || "",
+        phone_e164: phoneE164 || "",
+        zip: zipCode || "",
+        city: "",
+        state: "",
+        logo_url: "",
+        plan,
+      }).catch((e) => console.error("Airtable async sync failed:", e))
+    })
 
-    // ── Free plan: sync to Airtable AWAITED, then redirect ──────────────────
+    // ── Free plan: skip Stripe, go straight to dashboard ──
     if (plan === "Free") {
-      // Mark active first
       await supabase.from("profiles").update({ status: "active" }).eq("id", user.id)
-
-      // ── FIX: fetch the real saved profile row, then await Airtable sync ──
-      const { data: savedProfile } = await supabase
-        .from("profiles")
-        .select("*")
-        .eq("id", user.id)
-        .maybeSingle()
-
-      if (savedProfile) {
-        console.log(`[signup] Syncing Free plan mover to Airtable: ${normalizedEmail}`)
-        const atResult = await upsertAirtableMoverFromProfile(savedProfile)
-        console.log(`[signup] Airtable sync result for ${normalizedEmail}:`, atResult)
-      } else {
-        console.warn(`[signup] Could not fetch saved profile for Airtable sync: ${normalizedEmail}`)
-      }
-
       const baseUrl = process.env.PUBLIC_URL || "https://packrocket.co"
       return res.json({ ok: true, url: `${baseUrl}/dashboard?email=${encodeURIComponent(normalizedEmail)}` })
     }
-
-    // ── Paid plans: queue Airtable sync async (Stripe handles activation) ──
-    setImmediate(() => {
-      supabase
-        .from("profiles")
-        .select("*")
-        .eq("id", user.id)
-        .maybeSingle()
-        .then(({ data: savedProfile }) => {
-          if (savedProfile) {
-            return upsertAirtableMoverFromProfile(savedProfile)
-          }
-        })
-        .catch((e) => console.error("[signup] Async Airtable sync failed:", e))
-    })
 
     let stripeCustomerId = null
 
@@ -1454,32 +1490,6 @@ app.post("/api/signup", async (req, res) => {
       error: `Signup failed: ${err?.message || String(err)}`,
     })
   }
-})
-
-/* ----------------------------- Test signup (debug only) ------------------------------- */
-
-app.get("/api/test-signup", async (_req, res) => {
-  const results = {}
-  try {
-    const { data, error } = await supabase.from("profiles").select("id").limit(1)
-    results.supabase_profiles_read = error ? `ERROR: ${error.message}` : "OK"
-  } catch (e) {
-    results.supabase_profiles_read = `EXCEPTION: ${e.message}`
-  }
-  try {
-    const prices = { Free: "No Stripe price — handled on site", Pro: PRICE_IDS.Pro, Enterprise: PRICE_IDS.Enterprise }
-    results.stripe_prices = prices
-    results.stripe_key_ok = !!(process.env.STRIPE_SECRET_KEY)
-  } catch (e) {
-    results.stripe = `EXCEPTION: ${e.message}`
-  }
-  try {
-    const { data, error } = await supabase.auth.admin.listUsers({ page: 1, perPage: 1 })
-    results.supabase_auth_admin = error ? `ERROR: ${error.message}` : "OK"
-  } catch (e) {
-    results.supabase_auth_admin = `EXCEPTION: ${e.message}`
-  }
-  return res.json({ ok: true, results })
 })
 
 /* ------------------------------ Login route ------------------------------- */
