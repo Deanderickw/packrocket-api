@@ -149,7 +149,7 @@ async function upsertAirtableMoverFromProfile(profileRow) {
     const state = profileRow.state || ""
     const zip = profileRow.zip || ""
     const logoUrl = profileRow.logo_url || ""
-    const plan = profileRow.plan || "Starter"
+    const plan = profileRow.plan || "Free"
     const startingPrice = profileRow.starting_price || null
 
     const records = await table
@@ -192,7 +192,6 @@ async function upsertAirtableMoverFromProfile(profileRow) {
 /* ------------------------- Stripe price IDs ------------------------- */
 
 const PRICE_IDS = {
-  Starter: process.env.STRIPE_PRICE_STARTER,
   Pro: process.env.STRIPE_PRICE_PRO,
   Enterprise: process.env.STRIPE_PRICE_ENTERPRISE,
 }
@@ -1103,7 +1102,7 @@ app.get("/api/_debug-stripe", (_req, res) => {
   res.json({
     ok: true,
     prices: {
-      Starter: PRICE_IDS.Starter || "❌ MISSING — set STRIPE_PRICE_STARTER in Render",
+      Free: "Handled on site — no Stripe price needed",
       Pro: PRICE_IDS.Pro || "❌ MISSING — set STRIPE_PRICE_PRO in Render",
       Enterprise: PRICE_IDS.Enterprise || "❌ MISSING — set STRIPE_PRICE_ENTERPRISE in Render",
     },
@@ -1149,7 +1148,7 @@ app.get("/api/mover-dashboard", async (req, res) => {
     if (!profile) return res.status(404).json({ ok: false, error: "Profile not found" })
 
     const mover = mapProfileToMover(profile)
-    const subscriptionTier = profile.plan || "Starter"
+    const subscriptionTier = profile.plan || "Free"
     const nextPaymentDate = formatDateLabel(profile.current_period_end)
 
     return res.json({ ok: true, mover, subscriptionTier, nextPaymentDate })
@@ -1235,7 +1234,7 @@ app.get("/api/test-signup", async (_req, res) => {
     results.supabase_profiles_read = `EXCEPTION: ${e.message}`
   }
   try {
-    const prices = { Starter: PRICE_IDS.Starter, Pro: PRICE_IDS.Pro, Enterprise: PRICE_IDS.Enterprise }
+    const prices = { Free: "No Stripe price — handled on site", Pro: PRICE_IDS.Pro, Enterprise: PRICE_IDS.Enterprise }
     results.stripe_prices = prices
     results.stripe_key_ok = !!(process.env.STRIPE_SECRET_KEY)
   } catch (e) {
@@ -1263,7 +1262,7 @@ app.post("/api/signup", async (req, res) => {
       zipCode,
       password,
       smsOptIn,
-      plan = "Starter",
+      plan = "Free",
     } = req.body
 
     if (!email || !password) {
@@ -1360,6 +1359,13 @@ app.post("/api/signup", async (req, res) => {
       }).catch((e) => console.error("Airtable async sync failed:", e))
     })
 
+    // ── Free plan: skip Stripe, go straight to dashboard ──
+    if (plan === "Free") {
+      await supabase.from("profiles").update({ status: "active" }).eq("id", user.id)
+      const baseUrl = process.env.PUBLIC_URL || "https://packrocket.co"
+      return res.json({ ok: true, url: `${baseUrl}/dashboard?email=${encodeURIComponent(normalizedEmail)}` })
+    }
+
     let stripeCustomerId = null
 
     const { data: profileRow } = await supabase
@@ -1387,7 +1393,7 @@ app.post("/api/signup", async (req, res) => {
     const planPath =
       plan === "Pro" ? "/pro" : plan === "Enterprise" ? "/enterprise" : "/starter"
 
-    const priceId = PRICE_IDS[plan] || PRICE_IDS.Starter
+    const priceId = PRICE_IDS[plan]
     if (!priceId) {
       console.error("Stripe price ID missing for plan:", plan, "PRICE_IDS:", PRICE_IDS)
       return res.status(500).json({
