@@ -95,6 +95,7 @@ function formatDateLabel(isoOrMillis) {
   return date.toLocaleDateString("en-US", options)
 }
 
+// FIX 1: added plan and status fields
 function mapProfileToMover(profileRow) {
   if (!profileRow) return {}
   return {
@@ -118,6 +119,8 @@ function mapProfileToMover(profileRow) {
         ? Number(profileRow.starting_price)
         : undefined,
     features: [],
+    plan: profileRow.plan || "Free",
+    status: profileRow.status || "pending",
     profileCompletion: computeProfileCompletion(profileRow),
   }
 }
@@ -397,7 +400,7 @@ app.post("/api/leads", async (req, res) => {
       return res.status(404).json({ ok: false, error: "Mover not found or missing email" })
     }
 
-    // ── Free plan: enforce 1 lead per calendar month ──
+    // FIX 3: Free plan limit raised to 2 leads per calendar month
     if (moverPlan === "Free" && supabaseMoverId) {
       const now = new Date()
       const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString()
@@ -412,7 +415,7 @@ app.post("/api/leads", async (req, res) => {
 
       if (countErr) {
         console.error("Free plan lead count error:", countErr)
-      } else if (count >= 1) {
+      } else if (count >= 2) {
         console.log(`⛔ Free plan limit reached for mover: ${moverEmail} (${count} leads this month)`)
         return res.status(403).json({
           ok: false,
@@ -520,7 +523,7 @@ app.post("/api/message", async (req, res) => {
       return res.json({ ok: true, note: "Message received but no email found for mover" })
     }
 
-    // ── Free plan: enforce 1 message per calendar month ──
+    // FIX 3: Free plan limit raised to 2 messages per calendar month
     let messageMoverPlan = "Free"
     let messageSupabaseMoverId = null
     if (moverEmail) {
@@ -549,7 +552,7 @@ app.post("/api/message", async (req, res) => {
 
       if (countErr) {
         console.error("Free plan message count error:", countErr)
-      } else if (count >= 1) {
+      } else if (count >= 2) {
         console.log(`⛔ Free plan message limit reached for mover: ${moverEmail} (${count} messages this month)`)
         return res.status(403).json({
           ok: false,
@@ -1086,7 +1089,6 @@ app.get("/api/movers/:id/availability", async (req, res) => {
     const { id } = req.params
     if (!id) return res.status(400).json({ ok: false, error: "Missing id" })
 
-    // Try Supabase first
     const { data: profile } = await supabase
       .from("profiles")
       .select("id, plan")
@@ -1096,7 +1098,6 @@ app.get("/api/movers/:id/availability", async (req, res) => {
     let supabaseMoverId = profile?.id || null
     let moverPlan = profile?.plan || "Free"
 
-    // Fall back to Airtable lookup by record ID
     if (!supabaseMoverId) {
       try {
         const table = moversTable()
@@ -1118,12 +1119,10 @@ app.get("/api/movers/:id/availability", async (req, res) => {
       } catch {}
     }
 
-    // Pro/Enterprise: always available
     if (moverPlan !== "Free") {
       return res.json({ ok: true, available: true })
     }
 
-    // Free plan: check this month's lead count
     if (!supabaseMoverId) {
       return res.json({ ok: true, available: true })
     }
@@ -1144,7 +1143,8 @@ app.get("/api/movers/:id/availability", async (req, res) => {
       return res.json({ ok: true, available: true })
     }
 
-    const available = count < 1
+    // FIX 4: availability threshold raised to 2
+    const available = count < 2
     return res.json({ ok: true, available, plan: moverPlan })
   } catch (err) {
     console.error("/api/movers/:id/availability error:", err)
@@ -1477,24 +1477,22 @@ app.post("/api/signup", async (req, res) => {
       })
     }
 
-    setImmediate(() => {
-      upsertAirtableMoverFromProfile({
-        id: user.id,
-        email: normalizedEmail,
-        full_name: fullName || "",
-        business_name: businessName || "",
-        phone_e164: phoneE164 || "",
-        zip: zipCode || "",
-        city: "",
-        state: "",
-        logo_url: "",
-        plan,
-      }).catch((e) => console.error("Airtable async sync failed:", e))
-    })
-
-    // ── Free plan: skip Stripe, go straight to dashboard ──
+    // FIX 2: Free plan — await Airtable sync using real saved profile row
     if (plan === "Free") {
       await supabase.from("profiles").update({ status: "active" }).eq("id", user.id)
+
+      const { data: savedProfile } = await supabase
+        .from("profiles")
+        .select("*")
+        .eq("id", user.id)
+        .maybeSingle()
+
+      if (savedProfile) {
+        await upsertAirtableMoverFromProfile(savedProfile).catch((e) =>
+          console.error("Airtable Free signup sync failed:", e)
+        )
+      }
+
       const baseUrl = process.env.PUBLIC_URL || "https://packrocket.co"
       return res.json({ ok: true, url: `${baseUrl}/dashboard?email=${encodeURIComponent(normalizedEmail)}` })
     }
@@ -1521,6 +1519,21 @@ app.post("/api/signup", async (req, res) => {
         .update({ stripe_customer_id: customer.id })
         .eq("id", user.id)
     }
+
+    setImmediate(() => {
+      upsertAirtableMoverFromProfile({
+        id: user.id,
+        email: normalizedEmail,
+        full_name: fullName || "",
+        business_name: businessName || "",
+        phone_e164: phoneE164 || "",
+        zip: zipCode || "",
+        city: "",
+        state: "",
+        logo_url: "",
+        plan,
+      }).catch((e) => console.error("Airtable async sync failed:", e))
+    })
 
     const baseUrl = process.env.PUBLIC_URL || "https://packrocket.co"
     const planPath =
@@ -1596,16 +1609,18 @@ app.post("/api/login", async (req, res) => {
 
 /* --------------------- Stripe Billing Portal --------------------- */
 
+// FIX 5: Free plan → Stripe Checkout for Pro upgrade; Paid plan → Billing Portal
 app.get("/api/stripe/manage-billing", async (req, res) => {
   try {
     const rawEmail = req.query.email
     if (!rawEmail) return res.status(400).json({ ok: false, error: "Missing email" })
 
     const email = normalizeEmail(rawEmail)
+    const baseUrl = process.env.PUBLIC_URL || "https://packrocket.co"
 
     const { data: profile, error } = await supabase
       .from("profiles")
-      .select("id, stripe_customer_id")
+      .select("id, stripe_customer_id, plan")
       .ilike("email", email)
       .single()
 
@@ -1613,17 +1628,50 @@ app.get("/api/stripe/manage-billing", async (req, res) => {
       console.error("manage-billing supabase error:", error)
       return res.status(500).json({ ok: false, error: "Profile lookup failed" })
     }
-    if (!profile || !profile.stripe_customer_id) {
-      return res.status(404).json({ ok: false, error: "No Stripe customer for this email" })
+    if (!profile) {
+      return res.status(404).json({ ok: false, error: "Profile not found" })
     }
 
-    const baseUrl = process.env.PUBLIC_URL || "https://packrocket.co"
+    // Free plan: redirect to Stripe Checkout for Pro upgrade
+    if (!profile.stripe_customer_id || profile.plan === "Free") {
+      const priceId = PRICE_IDS.Pro
+      if (!priceId) {
+        return res.status(500).json({ ok: false, error: "Pro price not configured" })
+      }
 
+      let stripeCustomerId = profile.stripe_customer_id
+      if (!stripeCustomerId) {
+        const customer = await stripe.customers.create({
+          email,
+          metadata: { user_id: profile.id },
+        })
+        stripeCustomerId = customer.id
+        await supabase
+          .from("profiles")
+          .update({ stripe_customer_id: customer.id })
+          .eq("id", profile.id)
+      }
+
+      const session = await stripe.checkout.sessions.create({
+        mode: "subscription",
+        customer: stripeCustomerId,
+        line_items: [{ price: priceId, quantity: 1 }],
+        allow_promotion_codes: true,
+        success_url: `${baseUrl}/dashboard?session_id={CHECKOUT_SESSION_ID}&email=${encodeURIComponent(email)}`,
+        cancel_url: `${baseUrl}/dashboard?email=${encodeURIComponent(email)}`,
+      })
+
+      console.log("✅ manage-billing: Free plan → Checkout for:", email)
+      return res.redirect(303, session.url)
+    }
+
+    // Paid plan: open Billing Portal
     const portalSession = await stripe.billingPortal.sessions.create({
       customer: profile.stripe_customer_id,
       return_url: `${baseUrl}/dashboard?email=${encodeURIComponent(email)}`,
     })
 
+    console.log("✅ manage-billing: Paid plan → Billing Portal for:", email)
     return res.redirect(303, portalSession.url)
   } catch (err) {
     console.error("manage-billing route error:", err)
