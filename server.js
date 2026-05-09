@@ -1151,6 +1151,90 @@ app.get("/api/movers/:id/availability", async (req, res) => {
     return res.json({ ok: true, available: true })
   }
 })
+/* ── Nearby movers by radius (Haversine) ── */
+
+function haversineMiles(lat1, lng1, lat2, lng2) {
+  const R = 3958.8
+  const dLat = ((lat2 - lat1) * Math.PI) / 180
+  const dLng = ((lng2 - lng1) * Math.PI) / 180
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos((lat1 * Math.PI) / 180) *
+      Math.cos((lat2 * Math.PI) / 180) *
+      Math.sin(dLng / 2) ** 2
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+}
+
+app.get("/api/movers/nearby", async (req, res) => {
+  try {
+    const radiusMiles = Math.min(500, Math.max(1, parseFloat(req.query.radius) || 50))
+    const zipParam = String(req.query.zip || "").trim()
+    const latParam = parseFloat(req.query.lat)
+    const lngParam = parseFloat(req.query.lng)
+
+    let centerLat = null
+    let centerLng = null
+
+    if (isFinite(latParam) && isFinite(lngParam)) {
+      centerLat = latParam
+      centerLng = lngParam
+    } else if (zipParam) {
+      try {
+        const geoRes = await fetch(
+          `https://nominatim.openstreetmap.org/search?postalcode=${encodeURIComponent(zipParam)}&country=us&format=json&limit=1`,
+          { headers: { "User-Agent": "PackRocket/1.0", "Accept-Language": "en" } }
+        )
+        const geoData = await geoRes.json()
+        if (geoData?.[0]) {
+          centerLat = parseFloat(geoData[0].lat)
+          centerLng = parseFloat(geoData[0].lon)
+        }
+      } catch (geoErr) {
+        console.error("Geocode error:", geoErr?.message)
+      }
+    }
+
+    if (!isFinite(centerLat) || !isFinite(centerLng)) {
+      return res.status(400).json({ ok: false, error: "Could not resolve location. Provide lat/lng or a valid ZIP." })
+    }
+
+    const table = moversTable()
+    if (!table) return res.status(500).json({ ok: false, error: "Airtable not configured" })
+
+    const allRecords = []
+    await table.select({ maxRecords: 500 }).eachPage((recs, next) => {
+      allRecords.push(...recs)
+      next()
+    })
+
+    const nearby = []
+    for (const rec of allRecords) {
+      const lat = rec.fields.Lat
+      const lng = rec.fields.Lng
+      if (!isFinite(lat) || !isFinite(lng)) continue
+      const dist = haversineMiles(centerLat, centerLng, lat, lng)
+      if (dist <= radiusMiles) {
+        nearby.push({ record: rec, distanceMiles: Math.round(dist * 10) / 10 })
+      }
+    }
+
+    nearby.sort((a, b) => a.distanceMiles - b.distanceMiles)
+
+    return res.json({
+      ok: true,
+      centerLat,
+      centerLng,
+      radiusMiles,
+      records: nearby.map((n) => ({
+        ...n.record,
+        fields: { ...n.record.fields, _distanceMiles: n.distanceMiles },
+      })),
+    })
+  } catch (err) {
+    console.error("/api/movers/nearby error:", err)
+    return res.status(500).json({ ok: false, error: "Server error" })
+  }
+})
 
 /* ── Single mover by Airtable record ID ── */
 
@@ -1785,6 +1869,76 @@ app.get("/api/route", async (req, res) => {
 
 /* --------------------------------- Start ---------------------------------- */
 
+app.get("/api/movers/nearby", async (req, res) => {
+  try {
+    const radiusMiles = Math.min(500, Math.max(1, parseFloat(req.query.radius) || 50))
+    const zipParam = String(req.query.zip || "").trim()
+    const latParam = parseFloat(req.query.lat)
+    const lngParam = parseFloat(req.query.lng)
+
+    let centerLat = null
+    let centerLng = null
+
+    if (isFinite(latParam) && isFinite(lngParam)) {
+      centerLat = latParam
+      centerLng = lngParam
+    } else if (zipParam) {
+      try {
+        const geoRes = await fetch(
+          `https://nominatim.openstreetmap.org/search?postalcode=${encodeURIComponent(zipParam)}&country=us&format=json&limit=1`,
+          { headers: { "User-Agent": "PackRocket/1.0", "Accept-Language": "en" } }
+        )
+        const geoData = await geoRes.json()
+        if (geoData?.[0]) {
+          centerLat = parseFloat(geoData[0].lat)
+          centerLng = parseFloat(geoData[0].lon)
+        }
+      } catch (geoErr) {
+        console.error("Geocode error:", geoErr?.message)
+      }
+    }
+
+    if (!isFinite(centerLat) || !isFinite(centerLng)) {
+      return res.status(400).json({ ok: false, error: "Could not resolve location. Provide lat/lng or a valid ZIP." })
+    }
+
+    const table = moversTable()
+    if (!table) return res.status(500).json({ ok: false, error: "Airtable not configured" })
+
+    const allRecords = []
+    await table.select({ maxRecords: 500 }).eachPage((recs, next) => {
+      allRecords.push(...recs)
+      next()
+    })
+
+    const nearby = []
+    for (const rec of allRecords) {
+      const lat = rec.fields.Lat
+      const lng = rec.fields.Lng
+      if (!isFinite(lat) || !isFinite(lng)) continue
+      const dist = haversineMiles(centerLat, centerLng, lat, lng)
+      if (dist <= radiusMiles) {
+        nearby.push({ record: rec, distanceMiles: Math.round(dist * 10) / 10 })
+      }
+    }
+
+    nearby.sort((a, b) => a.distanceMiles - b.distanceMiles)
+
+    return res.json({
+      ok: true,
+      centerLat,
+      centerLng,
+      radiusMiles,
+      records: nearby.map((n) => ({
+        ...n.record,
+        fields: { ...n.record.fields, _distanceMiles: n.distanceMiles },
+      })),
+    })
+  } catch (err) {
+    console.error("/api/movers/nearby error:", err)
+    return res.status(500).json({ ok: false, error: "Server error" })
+  }
+})
 app.listen(PORT, () => {
   console.log(`✅ PackRocket API running on :${PORT}`)
 })
