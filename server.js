@@ -124,65 +124,94 @@ function mapProfileToMover(profileRow) {
     profileCompletion: computeProfileCompletion(profileRow),
   }
 }
+async function geocodeMoverAddress({ city, state, zip }) {
+  const parts = [city, state, zip].filter(Boolean).join(" ").trim()
+  if (!parts) throw new Error("No address to geocode")
 
+  const url =
+    `https://nominatim.openstreetmap.org/search` +
+    `?q=${encodeURIComponent(parts)}` +
+    `&countrycodes=us&format=json&limit=1&addressdetails=0`
+
+  const res = await fetch(url, {
+    headers: { "User-Agent": "PackRocket/1.0", "Accept-Language": "en" },
+  })
+  const data = await res.json()
+  if (!data?.[0]) throw new Error(`No geocode result for: ${parts}`)
+
+  return {
+    lat: parseFloat(data[0].lat),
+    lng: parseFloat(data[0].lon),
+  }
+}
 async function upsertAirtableMoverFromProfile(profileRow) {
   try {
     const table = moversTable()
-    if (
-      !process.env.AIRTABLE_PAT ||
-      !process.env.AIRTABLE_BASE_ID ||
-      !moversTableName ||
-      !table
-    ) {
-      console.log("Airtable env not fully set or table missing, skipping sync")
-      return
-    }
-    if (!profileRow || !profileRow.email) {
-      console.log("No profileRow or email passed to upsertAirtableMoverFromProfile")
-      return
-    }
-    const email = normalizeEmail(profileRow.email)
-    const safeEmail = email.replace(/"/g, '\\"')
-    const name = profileRow.business_name || profileRow.full_name || "Mover"
-    const phone = profileRow.phone_e164 || ""
-    const city = profileRow.city || ""
-    const state = profileRow.state || ""
-    const zip = profileRow.zip || ""
-    const logoUrl = profileRow.logo_url || ""
-    const plan = profileRow.plan || "Free"
-    const startingPrice = profileRow.starting_price || null
+    if (!table) return
 
-    const records = await table
-      .select({
-        filterByFormula: `{Email} = "${safeEmail}"`,
-        maxRecords: 1,
-      })
+    const email = normalizeEmail(profileRow.email)
+    if (!email) return
+
+    const name       = profileRow.business_name || profileRow.full_name || "Mover"
+    const city       = profileRow.city  || ""
+    const state      = profileRow.state || ""
+    const zip        = profileRow.zip   || ""
+    const plan       = profileRow.plan  || "Free"
+    const logoUrl    = profileRow.logo_url || ""
+    const startingPx = profileRow.starting_price || null
+    const radius     = profileRow.service_radius_miles ?? 50
+
+    // Auto-geocode from city/state/zip — movers never enter coordinates manually
+    let lat = profileRow.Lat ?? null
+    let lng = profileRow.Lng ?? null
+
+    if (city || state || zip) {
+      try {
+        const coords = await geocodeMoverAddress({ city, state, zip })
+        lat = coords.lat
+        lng = coords.lng
+        console.log(`📍 Geocoded ${email}: ${lat}, ${lng}`)
+
+        // Keep Supabase in sync
+        await supabase
+          .from("profiles")
+          .update({ lat, lng, geo_updated_at: new Date().toISOString() })
+          .eq("email", email)
+      } catch (geoErr) {
+        console.warn("Geocode failed for", email, "—", geoErr.message)
+      }
+    }
+
+    // Build Airtable fields
+    const safeEmail = email.replace(/"/g, '\\"')
+    const fields = {
+      Email:                email,
+      Name:                 name,
+      Phone:                profileRow.phone_e164 || "",
+      City:                 city,
+      State:                state,
+      ZIP:                  zip,
+      Plan:                 plan,
+      service_radius_miles: radius,
+    }
+
+    if (lat !== null) fields.Lat = lat
+    if (lng !== null) fields.Lng = lng
+    if (logoUrl)      fields.Logo = [{ url: logoUrl }]
+    if (startingPx !== null) fields["Starting price"] = startingPx
+
+    // Upsert
+    const existing = await table
+      .select({ filterByFormula: `{Email} = "${safeEmail}"`, maxRecords: 1 })
       .firstPage()
 
-    const fields = {
-      Email: email,
-      Name: name,
-      Phone: phone,
-      City: city,
-      State: state,
-      ZIP: zip,
-      Plan: plan,
-    }
-
-    if (logoUrl) {
-      fields.Logo = [{ url: logoUrl }]
-    }
-    if (startingPrice !== null) {
-      fields["Starting price"] = startingPrice
-    }
-
-    if (records.length > 0) {
-      await table.update([{ id: records[0].id, fields }])
-      console.log("✅ Updated Airtable mover row for:", email)
+    if (existing.length > 0) {
+      await table.update([{ id: existing[0].id, fields }])
     } else {
       await table.create([{ fields }])
-      console.log("✅ Created Airtable mover row for:", email)
     }
+
+    console.log("✅ Airtable upsert complete for:", email)
   } catch (err) {
     console.error("Airtable sync failed:", err)
   }
@@ -1004,12 +1033,96 @@ app.post("/api/upload-hero", upload.single("file"), async (req, res) => {
     return res.status(500).json({ ok: false, error: "Server error" })
   }
 })
+/* ── Nearby movers by radius (Haversine) ── */
+
+function haversineMiles(lat1, lng1, lat2, lng2) {
+  const R = 3958.8
+  const dLat = ((lat2 - lat1) * Math.PI) / 180
+  const dLng = ((lng2 - lng1) * Math.PI) / 180
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos((lat1 * Math.PI) / 180) *
+      Math.cos((lat2 * Math.PI) / 180) *
+      Math.sin(dLng / 2) ** 2
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+}
+
+app.get("/api/movers/nearby", async (req, res) => {
+  try {
+    const radiusMiles = Math.min(500, Math.max(1, parseFloat(req.query.radius) || 50))
+    const zipParam = String(req.query.zip || "").trim()
+    const latParam = parseFloat(req.query.lat)
+    const lngParam = parseFloat(req.query.lng)
+
+    let centerLat = null
+    let centerLng = null
+
+    if (isFinite(latParam) && isFinite(lngParam)) {
+      centerLat = latParam
+      centerLng = lngParam
+    } else if (zipParam) {
+      try {
+        const geoRes = await fetch(
+          `https://nominatim.openstreetmap.org/search?postalcode=${encodeURIComponent(zipParam)}&country=us&format=json&limit=1`,
+          { headers: { "User-Agent": "PackRocket/1.0", "Accept-Language": "en" } }
+        )
+        const geoData = await geoRes.json()
+        if (geoData?.[0]) {
+          centerLat = parseFloat(geoData[0].lat)
+          centerLng = parseFloat(geoData[0].lon)
+        }
+      } catch (geoErr) {
+        console.error("Geocode error:", geoErr?.message)
+      }
+    }
+
+    if (!isFinite(centerLat) || !isFinite(centerLng)) {
+      return res.status(400).json({ ok: false, error: "Could not resolve location. Provide lat/lng or a valid ZIP." })
+    }
+
+    const table = moversTable()
+    if (!table) return res.status(500).json({ ok: false, error: "Airtable not configured" })
+
+    const allRecords = []
+    await table.select({ maxRecords: 500 }).eachPage((recs, next) => {
+      allRecords.push(...recs)
+      next()
+    })
+
+    const nearby = []
+    for (const rec of allRecords) {
+      const lat = rec.fields.Lat
+      const lng = rec.fields.Lng
+      if (!isFinite(lat) || !isFinite(lng)) continue
+      const dist = haversineMiles(centerLat, centerLng, lat, lng)
+      if (dist <= radiusMiles) {
+        nearby.push({ record: rec, distanceMiles: Math.round(dist * 10) / 10 })
+      }
+    }
+
+    nearby.sort((a, b) => a.distanceMiles - b.distanceMiles)
+
+    return res.json({
+      ok: true,
+      centerLat,
+      centerLng,
+      radiusMiles,
+      records: nearby.map((n) => ({
+        ...n.record,
+        fields: { ...n.record.fields, _distanceMiles: n.distanceMiles },
+      })),
+    })
+  } catch (err) {
+    console.error("/api/movers/nearby error:", err)
+    return res.status(500).json({ ok: false, error: "Server error" })
+  }
+})
 
 /* ----------------------------- Movers search ------------------------------ */
 
 app.get("/api/movers", async (req, res) => {
   try {
-    const cityRaw = String(req.query.city || "").trim()
+    const cityRaw  = String(req.query.city  || "").trim()
     const stateRaw = String(req.query.state || "").trim()
     const queryRaw = String(req.query.query || "").trim()
 
@@ -1019,8 +1132,80 @@ app.get("/api/movers", async (req, res) => {
     const table = moversTable()
     if (!table) return res.status(500).json({ error: "Airtable not configured" })
 
+    // Step 1: Geocode the customer's search location
+    let customerLat = null
+    let customerLng = null
+    let customerCity = (cityRaw || queryRaw).toLowerCase().trim()
+
+    try {
+      const coords = await geocodeMoverAddress({
+        city:  cityRaw  || queryRaw,
+        state: stateRaw || "",
+        zip:   "",
+      })
+      customerLat = coords.lat
+      customerLng = coords.lng
+    } catch (geoErr) {
+      console.warn("Customer geocode failed, falling back to text search:", geoErr.message)
+    }
+
+    // Step 2: Fetch all movers
+    const allRecords = []
+    await table.select({ maxRecords: 500 }).eachPage((recs, next) => {
+      allRecords.push(...recs)
+      next()
+    })
+
+    // Step 3: Radius filter
+    if (customerLat !== null && customerLng !== null) {
+      const scored = []
+
+      for (const rec of allRecords) {
+        const moverLat    = rec.fields.Lat
+        const moverLng    = rec.fields.Lng
+        const moverRadius = rec.fields.service_radius_miles ?? 50
+
+        // No coordinates yet — fall back to text match
+        if (!isFinite(moverLat) || !isFinite(moverLng)) {
+          const textMatch =
+            (rec.fields.City  || "").toLowerCase().includes(customerCity) ||
+            (rec.fields.State || "").toLowerCase().includes(stateRaw.toLowerCase()) ||
+            (rec.fields.ZIP   || "").includes(queryRaw)
+          if (textMatch) scored.push({ rec, dist: Infinity, exactCity: false })
+          continue
+        }
+
+        const dist = haversineMiles(customerLat, customerLng, moverLat, moverLng)
+
+        // Only include if customer is within this mover's service radius
+        if (dist > moverRadius) continue
+
+        const exactCity =
+          (rec.fields.City || "").toLowerCase().trim() === customerCity
+
+        scored.push({ rec, dist, exactCity })
+      }
+
+      // Step 4: Exact city first, then closest
+      scored.sort((a, b) => {
+        if (a.exactCity !== b.exactCity) return a.exactCity ? -1 : 1
+        return a.dist - b.dist
+      })
+
+      const records = scored.map(({ rec, dist }) => ({
+        ...rec,
+        fields: {
+          ...rec.fields,
+          _distanceMiles: isFinite(dist) ? Math.round(dist * 10) / 10 : null,
+        },
+      }))
+
+      return res.json({ records })
+    }
+
+    // Step 5: Fallback text search (geocode unavailable)
     const qClean = qRaw.toLowerCase().replace(/,/g, " ").replace(/\s+/g, " ").trim()
-    const parts = qClean.split(" ").filter(Boolean)
+    const parts  = qClean.split(" ").filter(Boolean)
     const p1 = parts[0] || ""
     const p2 = parts[1] || ""
 
@@ -1029,17 +1214,16 @@ app.get("/api/movers", async (req, res) => {
       `REGEX_MATCH(LOWER(${fieldExpr} & ""), "${escapeRegex(needle)}")`
 
     let formula = ""
-
     if (p1 && p2) {
       formula = `OR(
         AND(${contains(p1, "{City}")}, ${contains(p2, "{State}")}),
         AND(${contains(p2, "{City}")}, ${contains(p1, "{State}")}),
-        ${contains(qClean, "({City} & \" \" & {State})")},
+        ${contains(qClean, '({City} & " " & {State})')},
         ${contains(qClean, "{Name}")}
       )`
     } else {
       formula = `OR(
-        ${contains(qClean, "({City} & \" \" & {State})")},
+        ${contains(qClean, '({City} & " " & {State})')},
         ${contains(qClean, "{City}")},
         ${contains(qClean, "{State}")},
         ${contains(qClean, "{Name}")},
@@ -1053,7 +1237,7 @@ app.get("/api/movers", async (req, res) => {
 
     return res.json({ records })
   } catch (err) {
-    console.error("movers route error:", err)
+    console.error("/api/movers error:", err)
     return res.status(500).json({ error: "Server error", details: err?.message || String(err) })
   }
 })
@@ -1149,90 +1333,6 @@ app.get("/api/movers/:id/availability", async (req, res) => {
   } catch (err) {
     console.error("/api/movers/:id/availability error:", err)
     return res.json({ ok: true, available: true })
-  }
-})
-/* ── Nearby movers by radius (Haversine) ── */
-
-function haversineMiles(lat1, lng1, lat2, lng2) {
-  const R = 3958.8
-  const dLat = ((lat2 - lat1) * Math.PI) / 180
-  const dLng = ((lng2 - lng1) * Math.PI) / 180
-  const a =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos((lat1 * Math.PI) / 180) *
-      Math.cos((lat2 * Math.PI) / 180) *
-      Math.sin(dLng / 2) ** 2
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
-}
-
-app.get("/api/movers/nearby", async (req, res) => {
-  try {
-    const radiusMiles = Math.min(500, Math.max(1, parseFloat(req.query.radius) || 50))
-    const zipParam = String(req.query.zip || "").trim()
-    const latParam = parseFloat(req.query.lat)
-    const lngParam = parseFloat(req.query.lng)
-
-    let centerLat = null
-    let centerLng = null
-
-    if (isFinite(latParam) && isFinite(lngParam)) {
-      centerLat = latParam
-      centerLng = lngParam
-    } else if (zipParam) {
-      try {
-        const geoRes = await fetch(
-          `https://nominatim.openstreetmap.org/search?postalcode=${encodeURIComponent(zipParam)}&country=us&format=json&limit=1`,
-          { headers: { "User-Agent": "PackRocket/1.0", "Accept-Language": "en" } }
-        )
-        const geoData = await geoRes.json()
-        if (geoData?.[0]) {
-          centerLat = parseFloat(geoData[0].lat)
-          centerLng = parseFloat(geoData[0].lon)
-        }
-      } catch (geoErr) {
-        console.error("Geocode error:", geoErr?.message)
-      }
-    }
-
-    if (!isFinite(centerLat) || !isFinite(centerLng)) {
-      return res.status(400).json({ ok: false, error: "Could not resolve location. Provide lat/lng or a valid ZIP." })
-    }
-
-    const table = moversTable()
-    if (!table) return res.status(500).json({ ok: false, error: "Airtable not configured" })
-
-    const allRecords = []
-    await table.select({ maxRecords: 500 }).eachPage((recs, next) => {
-      allRecords.push(...recs)
-      next()
-    })
-
-    const nearby = []
-    for (const rec of allRecords) {
-      const lat = rec.fields.Lat
-      const lng = rec.fields.Lng
-      if (!isFinite(lat) || !isFinite(lng)) continue
-      const dist = haversineMiles(centerLat, centerLng, lat, lng)
-      if (dist <= radiusMiles) {
-        nearby.push({ record: rec, distanceMiles: Math.round(dist * 10) / 10 })
-      }
-    }
-
-    nearby.sort((a, b) => a.distanceMiles - b.distanceMiles)
-
-    return res.json({
-      ok: true,
-      centerLat,
-      centerLng,
-      radiusMiles,
-      records: nearby.map((n) => ({
-        ...n.record,
-        fields: { ...n.record.fields, _distanceMiles: n.distanceMiles },
-      })),
-    })
-  } catch (err) {
-    console.error("/api/movers/nearby error:", err)
-    return res.status(500).json({ ok: false, error: "Server error" })
   }
 })
 
@@ -1391,6 +1491,7 @@ app.post("/api/update-profile", async (req, res) => {
       zip,
       logo_url,
       starting_price,
+       service_radius_miles,
     } = req.body
 
     if (!email) {
@@ -1408,6 +1509,7 @@ app.post("/api/update-profile", async (req, res) => {
       zip,
       logo_url,
       starting_price,
+      service_radius_miles,
       updated_at: new Date().toISOString(),
     }
 
@@ -1814,131 +1916,6 @@ app.post("/api/stripe/cancel-subscription", async (req, res) => {
   }
 })
 
-/* ── Global error handler ── */
-
-app.use((err, req, res, next) => {
-  if (err && err.code === "LIMIT_FILE_SIZE") {
-    return res.status(413).json({
-      ok: false,
-      error: "File too large. Please use a photo under 15MB.",
-      code: "FILE_TOO_LARGE"
-    })
-  }
-  if (err && err.code && err.code.startsWith("LIMIT_")) {
-    return res.status(413).json({
-      ok: false,
-      error: "Upload failed: " + err.message,
-      code: err.code
-    })
-  }
-  console.error("Unhandled error:", err)
-  return res.status(500).json({ ok: false, error: "Server error" })
-})
-
-/* ── Route proxy ── */
-
-app.get("/api/route", async (req, res) => {
-  try {
-    const { fromLat, fromLng, toLat, toLng } = req.query
-    if (!fromLat || !fromLng || !toLat || !toLng) {
-      return res.status(400).json({ error: "Missing coordinates" })
-    }
-
-    const url = `https://router.project-osrm.org/route/v1/driving/${fromLng},${fromLat};${toLng},${toLat}?overview=full&geometries=geojson&steps=false`
-
-    const response = await fetch(url, {
-      headers: { "User-Agent": "PackRocket/1.0" },
-    })
-
-    if (!response.ok) throw new Error(`OSRM error: ${response.status}`)
-
-    const data = await response.json()
-
-    if (data.code !== "Ok" || !data.routes?.[0]?.geometry?.coordinates?.length) {
-      throw new Error("No route returned")
-    }
-
-    const coordinates = data.routes[0].geometry.coordinates.map((c) => [c[1], c[0]])
-
-    return res.json({ coordinates })
-  } catch (err) {
-    console.error("/api/route error:", err?.message)
-    return res.status(500).json({ error: "Routing failed" })
-  }
-})
-
-/* --------------------------------- Start ---------------------------------- */
-
-app.get("/api/movers/nearby", async (req, res) => {
-  try {
-    const radiusMiles = Math.min(500, Math.max(1, parseFloat(req.query.radius) || 50))
-    const zipParam = String(req.query.zip || "").trim()
-    const latParam = parseFloat(req.query.lat)
-    const lngParam = parseFloat(req.query.lng)
-
-    let centerLat = null
-    let centerLng = null
-
-    if (isFinite(latParam) && isFinite(lngParam)) {
-      centerLat = latParam
-      centerLng = lngParam
-    } else if (zipParam) {
-      try {
-        const geoRes = await fetch(
-          `https://nominatim.openstreetmap.org/search?postalcode=${encodeURIComponent(zipParam)}&country=us&format=json&limit=1`,
-          { headers: { "User-Agent": "PackRocket/1.0", "Accept-Language": "en" } }
-        )
-        const geoData = await geoRes.json()
-        if (geoData?.[0]) {
-          centerLat = parseFloat(geoData[0].lat)
-          centerLng = parseFloat(geoData[0].lon)
-        }
-      } catch (geoErr) {
-        console.error("Geocode error:", geoErr?.message)
-      }
-    }
-
-    if (!isFinite(centerLat) || !isFinite(centerLng)) {
-      return res.status(400).json({ ok: false, error: "Could not resolve location. Provide lat/lng or a valid ZIP." })
-    }
-
-    const table = moversTable()
-    if (!table) return res.status(500).json({ ok: false, error: "Airtable not configured" })
-
-    const allRecords = []
-    await table.select({ maxRecords: 500 }).eachPage((recs, next) => {
-      allRecords.push(...recs)
-      next()
-    })
-
-    const nearby = []
-    for (const rec of allRecords) {
-      const lat = rec.fields.Lat
-      const lng = rec.fields.Lng
-      if (!isFinite(lat) || !isFinite(lng)) continue
-      const dist = haversineMiles(centerLat, centerLng, lat, lng)
-      if (dist <= radiusMiles) {
-        nearby.push({ record: rec, distanceMiles: Math.round(dist * 10) / 10 })
-      }
-    }
-
-    nearby.sort((a, b) => a.distanceMiles - b.distanceMiles)
-
-    return res.json({
-      ok: true,
-      centerLat,
-      centerLng,
-      radiusMiles,
-      records: nearby.map((n) => ({
-        ...n.record,
-        fields: { ...n.record.fields, _distanceMiles: n.distanceMiles },
-      })),
-    })
-  } catch (err) {
-    console.error("/api/movers/nearby error:", err)
-    return res.status(500).json({ ok: false, error: "Server error" })
-  }
-})
 app.listen(PORT, () => {
   console.log(`✅ PackRocket API running on :${PORT}`)
 })
