@@ -128,14 +128,45 @@ async function geocodeMoverAddress({ city, state, zip }) {
   const parts = [city, state, zip].filter(Boolean).join(" ").trim()
   if (!parts) throw new Error("No address to geocode")
 
+  // Try US Census first (free, no rate limit, works from servers)
+  try {
+    const benchmark = "Public_AR_Current"
+    const url = `https://geocoding.geo.census.gov/geocoder/locations/onelineaddress` +
+      `?address=${encodeURIComponent(parts)}` +
+      `&benchmark=${benchmark}&format=json`
+
+    const res = await fetch(url, {
+      headers: { "User-Agent": "PackRocket/1.0" },
+    })
+    const data = await res.json()
+    const match = data?.result?.addressMatches?.[0]
+    if (match) {
+      return {
+        lat: parseFloat(match.coordinates.y),
+        lng: parseFloat(match.coordinates.x),
+      }
+    }
+  } catch {}
+
+  // Fallback to Nominatim
   const url =
     `https://nominatim.openstreetmap.org/search` +
     `?q=${encodeURIComponent(parts)}` +
     `&countrycodes=us&format=json&limit=1&addressdetails=0`
 
   const res = await fetch(url, {
-    headers: { "User-Agent": "PackRocket/1.0", "Accept-Language": "en" },
+    headers: {
+      "User-Agent": "PackRocket/1.0 (packrocket.co)",
+      "Accept": "application/json",
+      "Accept-Language": "en",
+    },
   })
+
+  const contentType = res.headers.get("content-type") || ""
+  if (!contentType.includes("application/json")) {
+    throw new Error(`Geocoder unavailable`)
+  }
+
   const data = await res.json()
   if (!data?.[0]) throw new Error(`No geocode result for: ${parts}`)
 
