@@ -1947,6 +1947,38 @@ app.post("/api/stripe/cancel-subscription", async (req, res) => {
   }
 })
 
+/* ── Route proxy ── */
+
+app.get("/api/route", async (req, res) => {
+  try {
+    const { fromLat, fromLng, toLat, toLng } = req.query
+    if (!fromLat || !fromLng || !toLat || !toLng) {
+      return res.status(400).json({ error: "Missing coordinates" })
+    }
+
+    const url = `https://router.project-osrm.org/route/v1/driving/${fromLng},${fromLat};${toLng},${toLat}?overview=full&geometries=geojson&steps=false`
+
+    const response = await fetch(url, {
+      headers: { "User-Agent": "PackRocket/1.0" },
+    })
+
+    if (!response.ok) throw new Error(`OSRM error: ${response.status}`)
+
+    const data = await response.json()
+
+    if (data.code !== "Ok" || !data.routes?.[0]?.geometry?.coordinates?.length) {
+      throw new Error("No route returned")
+    }
+
+    const coordinates = data.routes[0].geometry.coordinates.map((c) => [c[1], c[0]])
+
+    return res.json({ coordinates })
+  } catch (err) {
+    console.error("/api/route error:", err?.message)
+    return res.status(500).json({ error: "Routing failed" })
+  }
+})
+
 app.listen(PORT, () => {
   console.log(`✅ PackRocket API running on :${PORT}`)
 })
