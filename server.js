@@ -1139,6 +1139,7 @@ app.get("/api/movers", async (req, res) => {
     }
 
    // Fallback text search — split query into parts
+const qClean = qRaw.toLowerCase().trim()
 const parts = qClean.split(/\s+/).filter(Boolean)
 const filtered = allMovers.filter((m) => {
   const city  = (m.city  || "").toLowerCase()
