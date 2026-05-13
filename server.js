@@ -225,6 +225,44 @@ async function upsertSupabaseMoverFromProfile(profileRow) {
   }
 }
 
+/* ------------------------- Airtable shape mapper ------------------------- */
+
+function mapMoverToAirtableShape(mover) {
+  return {
+    id: mover.id,
+    fields: {
+      Name: mover.name,
+      Email: mover.email,
+      Phone: mover.phone,
+      City: mover.city,
+      State: mover.state,
+      ZIP: mover.zip,
+      Lat: mover.lat,
+      Lng: mover.lng,
+      Verified: mover.verified === true || mover.verified === "true" || mover.verified === "checked",
+      ["Starting price"]: mover.starting_price ? Number(mover.starting_price) : undefined,
+      Rating: mover.rating ? Number(mover.rating) : undefined,
+      Features: mover.features
+        ? String(mover.features).split(",").map((s) => s.trim()).filter(Boolean)
+        : [],
+      Logo: mover.logo_url ? [{ url: mover.logo_url }] : [],
+      ["Hero Photo"]: mover.hero_photo_url ? [{ url: mover.hero_photo_url }] : [],
+      Photo: mover.photo_url ? [{ url: mover.photo_url }] : [],
+      Description: mover.description || "",
+      ["Service Areas"]: mover.service_areas || "",
+      Services: mover.services
+        ? String(mover.services).split(",").map((s) => s.trim()).filter(Boolean)
+        : [],
+      Plan: mover.plan || "Free",
+      Badge: mover.badge || "",
+      ["Response Time"]: mover.response_time || "",
+      ["Price Range"]: mover.price_range_max ? `$0–$${mover.price_range_max}` : "",
+      service_radius_miles: mover.service_radius_miles,
+      _distanceMiles: mover._distanceMiles ?? null,
+    },
+  }
+}
+
 /* ------------------------- Haversine ------------------------- */
 
 function haversineMiles(lat1, lng1, lat2, lng2) {
@@ -1017,10 +1055,9 @@ app.get("/api/movers/nearby", async (req, res) => {
       centerLat,
       centerLng,
       radiusMiles,
-      records: nearby.map(({ mover, distanceMiles }) => ({
-        id: mover.id,
-        fields: { ...mover, _distanceMiles: distanceMiles },
-      })),
+      records: nearby.map(({ mover, distanceMiles }) =>
+        mapMoverToAirtableShape({ ...mover, _distanceMiles: distanceMiles })
+      ),
     })
   } catch (err) {
     console.error("/api/movers/nearby error:", err)
@@ -1091,13 +1128,12 @@ app.get("/api/movers", async (req, res) => {
         return a.dist - b.dist
       })
 
-      const records = scored.map(({ mover, dist }) => ({
-        id: mover.id,
-        fields: {
+      const records = scored.map(({ mover, dist }) =>
+        mapMoverToAirtableShape({
           ...mover,
           _distanceMiles: isFinite(dist) ? Math.round(dist * 10) / 10 : null,
-        },
-      }))
+        })
+      )
 
       return res.json({ records })
     }
@@ -1112,7 +1148,7 @@ app.get("/api/movers", async (req, res) => {
     )
 
     return res.json({
-      records: filtered.map((m) => ({ id: m.id, fields: m })),
+      records: filtered.map((m) => mapMoverToAirtableShape(m)),
     })
   } catch (err) {
     console.error("/api/movers error:", err)
@@ -1135,7 +1171,7 @@ app.get("/api/movers/by-email", async (req, res) => {
 
     if (error || !mover) return res.status(404).json({ ok: false, error: "Not found" })
 
-    return res.json({ ok: true, record: { id: mover.id, fields: mover } })
+    return res.json({ ok: true, record: mapMoverToAirtableShape(mover) })
   } catch (err) {
     console.error("/api/movers/by-email error:", err)
     return res.status(500).json({ ok: false, error: "Server error" })
@@ -1218,7 +1254,7 @@ app.get("/api/movers/:id", async (req, res) => {
 
     if (error || !mover) return res.status(404).json({ error: "Mover not found" })
 
-    return res.json({ record: { id: mover.id, fields: mover } })
+    return res.json({ record: mapMoverToAirtableShape(mover) })
   } catch (err) {
     console.error("movers/:id error:", err)
     return res.status(404).json({ error: "Mover not found" })
