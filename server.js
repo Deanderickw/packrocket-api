@@ -1583,8 +1583,9 @@ app.get("/api/stripe/manage-billing", async (req, res) => {
     if (error || !profile) return res.status(404).json({ ok: false, error: "Profile not found" })
 
     if (!profile.stripe_customer_id || profile.plan === "Free") {
-      const priceId = PRICE_IDS.Pro
-      if (!priceId) return res.status(500).json({ ok: false, error: "Pro price not configured" })
+      const requestedPlan = req.query.plan || "Pro"
+      const priceId = PRICE_IDS[requestedPlan] || PRICE_IDS.Pro
+      if (!priceId) return res.status(500).json({ ok: false, error: `${requestedPlan} price not configured` })
 
       let stripeCustomerId = profile.stripe_customer_id
       if (!stripeCustomerId) {
