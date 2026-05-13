@@ -1138,14 +1138,17 @@ app.get("/api/movers", async (req, res) => {
       return res.json({ records })
     }
 
-    // Fallback text search
-    const qClean = qRaw.toLowerCase().trim()
-    const filtered = allMovers.filter((m) =>
-      (m.city  || "").toLowerCase().includes(qClean) ||
-      (m.state || "").toLowerCase().includes(qClean) ||
-      (m.name  || "").toLowerCase().includes(qClean) ||
-      (m.zip   || "").includes(qClean)
-    )
+   // Fallback text search — split query into parts
+const parts = qClean.split(/\s+/).filter(Boolean)
+const filtered = allMovers.filter((m) => {
+  const city  = (m.city  || "").toLowerCase()
+  const state = (m.state || "").toLowerCase()
+  const name  = (m.name  || "").toLowerCase()
+  const zip   = (m.zip   || "")
+  return parts.every(p =>
+    city.includes(p) || state.includes(p) || name.includes(p) || zip.includes(p)
+  )
+})
 
     return res.json({
       records: filtered.map((m) => mapMoverToAirtableShape(m)),
