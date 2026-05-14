@@ -1076,12 +1076,13 @@ app.get("/api/movers", async (req, res) => {
     const qRaw = queryRaw || [cityRaw, stateRaw].filter(Boolean).join(" ").trim()
     if (!qRaw) return res.json({ records: [] })
 
-    let customerLat = null
-    let customerLng = null
-    const customerCity = (cityRaw || queryRaw).toLowerCase().trim()
+  let customerLat = parseFloat(req.query.lat) || null
+let customerLng = parseFloat(req.query.lng) || null
+const customerCity = (cityRaw || queryRaw).toLowerCase().trim()
 
-    try {
-      const coords = await geocodeMoverAddress({
+if (!isFinite(customerLat) || !isFinite(customerLng)) {
+try {
+  const coords = await geocodeMoverAddress({
         city:  cityRaw  || queryRaw,
         state: stateRaw || "",
         zip:   "",
@@ -1089,8 +1090,9 @@ app.get("/api/movers", async (req, res) => {
       customerLat = coords.lat
       customerLng = coords.lng
     } catch (geoErr) {
-      console.warn("Customer geocode failed, falling back to text search:", geoErr.message)
-    }
+     console.warn("Customer geocode failed, falling back to text search:", geoErr.message)
+  }
+}
 
     const { data: allMovers, error } = await supabase
       .from("movers")
