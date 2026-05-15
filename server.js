@@ -1076,8 +1076,10 @@ app.get("/api/movers", async (req, res) => {
     const qRaw = queryRaw || [cityRaw, stateRaw].filter(Boolean).join(" ").trim()
     if (!qRaw) return res.json({ records: [] })
 
-  let customerLat = parseFloat(req.query.lat) || null
-let customerLng = parseFloat(req.query.lng) || null
+const _lat = parseFloat(req.query.lat)
+  const _lng = parseFloat(req.query.lng)
+  let customerLat = isFinite(_lat) ? _lat : null
+  let customerLng = isFinite(_lng) ? _lng : null
 const customerCity = (cityRaw || queryRaw).toLowerCase().trim()
 
 if (!isFinite(customerLat) || !isFinite(customerLng)) {
