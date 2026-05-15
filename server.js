@@ -108,6 +108,7 @@ function mapProfileToMover(profileRow) {
 async function geocodeMoverAddress({ city, state, zip }) {
   const parts = [city, state, zip].filter(Boolean).join(" ").trim()
   if (!parts) throw new Error("No address to geocode")
+  console.log("Geocoding parts:", parts)
 
   // Try Census geocoder first (no rate limits, US only)
   try {
@@ -1082,6 +1083,7 @@ try {
         state: stateRaw || "",
         zip:   "",
       })
+      console.log("Geocoded successfully:", customerLat, customerLng)
       customerLat = coords.lat
       customerLng = coords.lng
     } catch (geoErr) {
