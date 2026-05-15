@@ -112,7 +112,7 @@ async function geocodeMoverAddress({ city, state, zip }) {
 
   // Try Census geocoder first (no rate limits, US only)
   try {
-    const censusUrl = `https://geocoding.geo.census.gov/geocoder/locations/onelineaddress?address=${encodeURIComponent(parts)}&benchmark=Public_AR_Current&format=json`
+   const censusUrl = `https://geocoding.geo.census.gov/geocoder/locations/onelineaddress?address=${encodeURIComponent(parts + ", US")}&benchmark=Public_AR_Current&format=json`
     const res = await fetch(censusUrl, { 
       headers: { "User-Agent": "PackRocket/1.0" },
       signal: AbortSignal.timeout(8000)
@@ -131,7 +131,7 @@ async function geocodeMoverAddress({ city, state, zip }) {
 
   // Try Photon (no API key, no rate limits)
   try {
-    const photonUrl = `https://photon.komoot.io/api/?q=${encodeURIComponent(parts)}&limit=1&countrycodes=us`
+   const photonUrl = `https://photon.komoot.io/api/?q=${encodeURIComponent(parts)}&limit=1&countrycode=us`
     const res = await fetch(photonUrl, {
       headers: { "User-Agent": "PackRocket/1.0 (packrocket.co)" },
       signal: AbortSignal.timeout(8000)
