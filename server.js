@@ -413,6 +413,21 @@ app.use(express.json())
 /* ------------------------ Health check ------------------------ */
 
 app.get("/api/health", (_req, res) => res.json({ ok: true }))
+app.get("/api/test-geo", async (_req, res) => {
+  try {
+    const censusUrl = `https://geocoding.geo.census.gov/geocoder/locations/onelineaddress?address=${encodeURIComponent("Mobile Alabama")}&benchmark=Public_AR_Current&format=json`
+    const censusRes = await fetch(censusUrl, { headers: { "User-Agent": "PackRocket/1.0" } })
+    const censusData = await censusRes.json()
+
+    const photonUrl = `https://photon.komoot.io/api/?q=${encodeURIComponent("Mobile Alabama")}&limit=1&countrycodes=us`
+    const photonRes = await fetch(photonUrl, { headers: { "User-Agent": "PackRocket/1.0" } })
+    const photonData = await photonRes.json()
+
+    res.json({ census: censusData, photon: photonData })
+  } catch (err) {
+    res.json({ error: err.message })
+  }
+})
 
 /* ------------------------ Create Lead + Email Mover ------------------------ */
 
