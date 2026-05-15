@@ -1076,15 +1076,12 @@ app.get("/api/movers", async (req, res) => {
     const qRaw = queryRaw || [cityRaw, stateRaw].filter(Boolean).join(" ").trim()
     if (!qRaw) return res.json({ records: [] })
 
-const _lat = parseFloat(req.query.lat)
-  const _lng = parseFloat(req.query.lng)
-  let customerLat = isFinite(_lat) ? _lat : null
-  let customerLng = isFinite(_lng) ? _lng : null
-const customerCity = (cityRaw || queryRaw).toLowerCase().trim()
+    let customerLat = null
+    let customerLng = null
+    const customerCity = (cityRaw || queryRaw).toLowerCase().trim()
 
-if (!isFinite(customerLat) || !isFinite(customerLng)) {
-try {
-  const coords = await geocodeMoverAddress({
+    try {
+      const coords = await geocodeMoverAddress({
         city:  cityRaw  || queryRaw,
         state: stateRaw || "",
         zip:   "",
@@ -1092,9 +1089,8 @@ try {
       customerLat = coords.lat
       customerLng = coords.lng
     } catch (geoErr) {
-     console.warn("Customer geocode failed, falling back to text search:", geoErr.message)
-  }
-}
+      console.warn("Customer geocode failed, falling back to text search:", geoErr.message)
+    }
 
     const { data: allMovers, error } = await supabase
       .from("movers")
@@ -1142,18 +1138,14 @@ try {
       return res.json({ records })
     }
 
-   // Fallback text search — split query into parts
-const qClean = qRaw.toLowerCase().trim()
-const parts = qClean.split(/\s+/).filter(Boolean)
-const filtered = allMovers.filter((m) => {
-  const city  = (m.city  || "").toLowerCase()
-  const state = (m.state || "").toLowerCase()
-  const name  = (m.name  || "").toLowerCase()
-  const zip   = (m.zip   || "")
-  return parts.every(p =>
-    city.includes(p) || state.includes(p) || name.includes(p) || zip.includes(p)
-  )
-})
+    // Fallback text search
+    const qClean = qRaw.toLowerCase().trim()
+    const filtered = allMovers.filter((m) =>
+      (m.city  || "").toLowerCase().includes(qClean) ||
+      (m.state || "").toLowerCase().includes(qClean) ||
+      (m.name  || "").toLowerCase().includes(qClean) ||
+      (m.zip   || "").includes(qClean)
+    )
 
     return res.json({
       records: filtered.map((m) => mapMoverToAirtableShape(m)),
@@ -1591,9 +1583,8 @@ app.get("/api/stripe/manage-billing", async (req, res) => {
     if (error || !profile) return res.status(404).json({ ok: false, error: "Profile not found" })
 
     if (!profile.stripe_customer_id || profile.plan === "Free") {
-      const requestedPlan = req.query.plan || "Pro"
-      const priceId = PRICE_IDS[requestedPlan] || PRICE_IDS.Pro
-      if (!priceId) return res.status(500).json({ ok: false, error: `${requestedPlan} price not configured` })
+      const priceId = PRICE_IDS.Pro
+      if (!priceId) return res.status(500).json({ ok: false, error: "Pro price not configured" })
 
       let stripeCustomerId = profile.stripe_customer_id
       if (!stripeCustomerId) {
