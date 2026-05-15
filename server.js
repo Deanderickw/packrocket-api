@@ -109,13 +109,13 @@ async function geocodeMoverAddress({ city, state, zip }) {
   const parts = [city, state, zip].filter(Boolean).join(" ").trim()
   if (!parts) throw new Error("No address to geocode")
 
+  // Try Census geocoder first (no rate limits, US only)
   try {
-    const benchmark = "Public_AR_Current"
-    const url = `https://geocoding.geo.census.gov/geocoder/locations/onelineaddress` +
-      `?address=${encodeURIComponent(parts)}` +
-      `&benchmark=${benchmark}&format=json`
-
-    const res = await fetch(url, { headers: { "User-Agent": "PackRocket/1.0" } })
+    const censusUrl = `https://geocoding.geo.census.gov/geocoder/locations/onelineaddress?address=${encodeURIComponent(parts)}&benchmark=Public_AR_Current&format=json`
+    const res = await fetch(censusUrl, { 
+      headers: { "User-Agent": "PackRocket/1.0" },
+      signal: AbortSignal.timeout(8000)
+    })
     const data = await res.json()
     const match = data?.result?.addressMatches?.[0]
     if (match) {
@@ -124,33 +124,30 @@ async function geocodeMoverAddress({ city, state, zip }) {
         lng: parseFloat(match.coordinates.x),
       }
     }
-  } catch {}
-
-  const url =
-    `https://nominatim.openstreetmap.org/search` +
-    `?q=${encodeURIComponent(parts)}` +
-    `&countrycodes=us&format=json&limit=1&addressdetails=0`
-
-  const res = await fetch(url, {
-    headers: {
-      "User-Agent": "PackRocket/1.0 (packrocket.co)",
-      "Accept": "application/json",
-      "Accept-Language": "en",
-    },
-  })
-
-  const contentType = res.headers.get("content-type") || ""
-  if (!contentType.includes("application/json")) {
-    throw new Error(`Geocoder unavailable`)
+  } catch (e) {
+    console.warn("Census geocoder failed:", e.message)
   }
 
-  const data = await res.json()
-  if (!data?.[0]) throw new Error(`No geocode result for: ${parts}`)
-
-  return {
-    lat: parseFloat(data[0].lat),
-    lng: parseFloat(data[0].lon),
+  // Try Photon (no API key, no rate limits)
+  try {
+    const photonUrl = `https://photon.komoot.io/api/?q=${encodeURIComponent(parts)}&limit=1&countrycodes=us`
+    const res = await fetch(photonUrl, {
+      headers: { "User-Agent": "PackRocket/1.0 (packrocket.co)" },
+      signal: AbortSignal.timeout(8000)
+    })
+    const data = await res.json()
+    const feature = data?.features?.[0]
+    if (feature) {
+      return {
+        lat: feature.geometry.coordinates[1],
+        lng: feature.geometry.coordinates[0],
+      }
+    }
+  } catch (e) {
+    console.warn("Photon geocoder failed:", e.message)
   }
+
+  throw new Error("All geocoders failed")
 }
 
 /* 
@@ -1079,8 +1076,7 @@ app.get("/api/movers", async (req, res) => {
     let customerLat = null
     let customerLng = null
     const customerCity = (cityRaw || queryRaw).toLowerCase().trim()
-
-    try {
+try {
       const coords = await geocodeMoverAddress({
         city:  cityRaw  || queryRaw,
         state: stateRaw || "",
@@ -1090,6 +1086,7 @@ app.get("/api/movers", async (req, res) => {
       customerLng = coords.lng
     } catch (geoErr) {
       console.warn("Customer geocode failed, falling back to text search:", geoErr.message)
+      console.warn("Query was:", cityRaw, stateRaw, queryRaw)
     }
 
     const { data: allMovers, error } = await supabase
