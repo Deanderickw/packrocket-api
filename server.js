@@ -499,7 +499,7 @@ app.post("/api/leads", async (req, res) => {
         .gte("created_at", monthStart)
         .lt("created_at", monthEnd)
 
-      if (count >= 2) {
+      if (count >= 1) {
         return res.status(403).json({
           ok: false,
           code: "FREE_PLAN_LIMIT",
@@ -627,7 +627,7 @@ app.post("/api/message", async (req, res) => {
         .gte("created_at", monthStart)
         .lt("created_at", monthEnd)
 
-      if (count >= 2) {
+      if (count >= 1) {
         return res.status(403).json({
           ok: false,
           code: "FREE_PLAN_LIMIT",
@@ -1232,7 +1232,7 @@ app.get("/api/movers/:id/availability", async (req, res) => {
       .gte("created_at", monthStart)
       .lt("created_at", monthEnd)
 
-    return res.json({ ok: true, available: count < 2, plan: moverPlan })
+    return res.json({ ok: true, available: count < 1, plan: moverPlan })
   } catch (err) {
     console.error("/api/movers/:id/availability error:", err)
     return res.json({ ok: true, available: true })
