@@ -110,42 +110,57 @@ async function geocodeMoverAddress({ city, state, zip }) {
   if (!parts) throw new Error("No address to geocode")
   console.log("Geocoding parts:", parts)
 
-  // Try Census geocoder first (no rate limits, US only)
+  // 1. Google Maps (primary)
+  if (process.env.GOOGLE_MAPS_API_KEY) {
+    try {
+      const gUrl = `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(parts + ", US")}&key=${process.env.GOOGLE_MAPS_API_KEY}`
+      const res = await fetch(gUrl, { signal: AbortSignal.timeout(8000) })
+      const data = await res.json()
+      if (data.status === "OK" && data.results?.[0]) {
+        const loc = data.results[0].geometry.location
+        console.log("Google geocoded:", loc.lat, loc.lng)
+        return { lat: loc.lat, lng: loc.lng }
+      }
+      console.warn("Google geocoder no results:", data.status)
+    } catch (e) {
+      console.warn("Google geocoder failed:", e.message)
+    }
+  }
+
+  // 2. Census fallback
   try {
-   const censusUrl = `https://geocoding.geo.census.gov/geocoder/locations/onelineaddress?address=${encodeURIComponent(parts + ", US")}&benchmark=Public_AR_Current&format=json`
-    const res = await fetch(censusUrl, { 
+    const censusUrl = `https://geocoding.geo.census.gov/geocoder/locations/onelineaddress?address=${encodeURIComponent(parts + ", US")}&benchmark=Public_AR_Current&format=json`
+    const res = await fetch(censusUrl, {
       headers: { "User-Agent": "PackRocket/1.0" },
       signal: AbortSignal.timeout(8000)
     })
-    const data = await res.json()
-    const match = data?.result?.addressMatches?.[0]
-    if (match) {
-      return {
-        lat: parseFloat(match.coordinates.y),
-        lng: parseFloat(match.coordinates.x),
+    if (res.ok) {
+      const data = await res.json()
+      const match = data?.result?.addressMatches?.[0]
+      if (match) {
+        return { lat: parseFloat(match.coordinates.y), lng: parseFloat(match.coordinates.x) }
       }
     }
   } catch (e) {
     console.warn("Census geocoder failed:", e.message)
   }
 
-  // Try Photon (no API key, no rate limits)
+  // 3. Nominatim fallback
   try {
-   const photonUrl = `https://photon.komoot.io/api/?q=${encodeURIComponent(parts)}&limit=1&countrycode=us`
-    const res = await fetch(photonUrl, {
-      headers: { "User-Agent": "PackRocket/1.0 (packrocket.co)" },
+    const nomUrl = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(parts)}&countrycodes=us&format=json&limit=1`
+    const res = await fetch(nomUrl, {
+      headers: { "User-Agent": "PackRocket/1.0 (packrocket.co)", "Accept": "application/json" },
       signal: AbortSignal.timeout(8000)
     })
-    const data = await res.json()
-    const feature = data?.features?.[0]
-    if (feature) {
-      return {
-        lat: feature.geometry.coordinates[1],
-        lng: feature.geometry.coordinates[0],
+    const contentType = res.headers.get("content-type") || ""
+    if (res.ok && contentType.includes("application/json")) {
+      const data = await res.json()
+      if (data?.[0]) {
+        return { lat: parseFloat(data[0].lat), lng: parseFloat(data[0].lon) }
       }
     }
   } catch (e) {
-    console.warn("Photon geocoder failed:", e.message)
+    console.warn("Nominatim geocoder failed:", e.message)
   }
 
   throw new Error("All geocoders failed")
@@ -1084,9 +1099,9 @@ try {
         state: stateRaw || "",
         zip:   "",
       })
-      console.log("Geocoded successfully:", customerLat, customerLng)
       customerLat = coords.lat
       customerLng = coords.lng
+      console.log("Geocoded successfully:", customerLat, customerLng)
     } catch (geoErr) {
       console.warn("Customer geocode failed, falling back to text search:", geoErr.message)
       console.warn("Query was:", cityRaw, stateRaw, queryRaw)
