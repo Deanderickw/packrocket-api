@@ -1707,3 +1707,24 @@ app.get("/api/_debug", (_req, res) => {
 app.listen(PORT, () => {
   console.log(`✅ PackRocket API running on :${PORT}`)
 })
+/* ── Support contact ── */
+
+app.post("/api/support", async (req, res) => {
+  try {
+    const { name, email, subject, message } = req.body || {}
+    if (!name || !email || !message) {
+      return res.status(400).json({ ok: false, error: "Missing fields" })
+    }
+    await resend.emails.send({
+      from: "PackRocket Support <leads@packrocket.co>",
+      to: [process.env.LEADS_BCC_EMAIL],
+      replyTo: email,
+      subject: `Support: ${subject || "General"} — ${name}`,
+      text: `Name: ${name}\nEmail: ${email}\nSubject: ${subject}\n\n${message}`,
+    })
+    return res.json({ ok: true })
+  } catch (err) {
+    console.error("/api/support error:", err)
+    return res.status(500).json({ ok: false })
+  }
+})
