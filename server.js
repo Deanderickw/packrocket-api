@@ -1703,10 +1703,36 @@ app.get("/api/_debug", (_req, res) => {
     airtable: "REMOVED — all data now in Supabase movers table",
   })
 })
+/* ── Update account email ── */
 
-app.listen(PORT, () => {
-  console.log(`✅ PackRocket API running on :${PORT}`)
-})
+app.post("/api/update-email", async (req, res) => {
+  try {
+    const { email, newEmail } = req.body || {}
+    if (!email || !newEmail) {
+      return res.status(400).json({ ok: false, error: "Missing fields" })
+    }
+    const normalizedNew = normalizeEmail(newEmail)
+    const { data: profile } = await supabase
+      .from("profiles")
+      .select("id")
+      .eq("email", normalizeEmail(email))
+      .maybeSingle()
+    if (!profile?.id) {
+      return res.status(404).json({ ok: false, error: "User not found" })
+    }
+    const { error: authErr } = await supabase.auth.admin.updateUserById(profile.id, { email: normalizedNew })
+    if (authErr) {
+      return res.status(500).json({ ok: false, error: "Failed to update email" })
+    }
+    await supabase.from("profiles").update({ email: normalizedNew }).eq("id", profile.id)
+    await supabase.from("movers").update({ email: normalizedNew }).ilike("email", normalizeEmail(email))
+    return res.json({ ok: true })
+  } catch (err) {
+    console.error("/api/update-email error:", err)
+    return res.status(500).json({ ok: false, error: "Server error" })
+  }
+}) 
+
 /* ── Support contact ── */
 
 app.post("/api/support", async (req, res) => {
@@ -1727,4 +1753,8 @@ app.post("/api/support", async (req, res) => {
     console.error("/api/support error:", err)
     return res.status(500).json({ ok: false })
   }
+})
+
+app.listen(PORT, () => {
+  console.log(`✅ PackRocket API running on :${PORT}`)
 })
