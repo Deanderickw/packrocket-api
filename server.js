@@ -268,7 +268,7 @@ function mapMoverToAirtableShape(mover) {
         : [],
       Plan: mover.plan || "Free",
       Badge: mover.badge || "",
-      ["Response Time"]: mover.response_time || "",
+     ["Business Hours"]: mover.business_hours || "",
       ["Price Range"]: mover.price_range_max ? `$0–$${mover.price_range_max}` : "",
       service_radius_miles: mover.service_radius_miles,
       _distanceMiles: mover._distanceMiles ?? null,
@@ -1280,7 +1280,7 @@ app.get("/api/movers/:id", async (req, res) => {
 
 app.post("/api/update-listing", async (req, res) => {
   try {
-    const { email, description, features, service_areas, services, response_time, website } = req.body || {}
+   const { email, description, features, service_areas, services, response_time, website, business_hours } = req.body || {}
 
     if (!email) return res.status(400).json({ ok: false, error: "Missing email" })
 
@@ -1290,7 +1290,7 @@ app.post("/api/update-listing", async (req, res) => {
     if (service_areas !== undefined && service_areas !== "") updates.service_areas = service_areas
     if (services !== undefined) updates.services = Array.isArray(services) ? services.join(",") : services
     if (response_time !== undefined && response_time !== "") updates.response_time = response_time
-    if (website !== undefined && website !== "") updates.website = website
+if (business_hours !== undefined && business_hours !== "") updates.business_hours = business_hours
 
     const { error } = await supabase
       .from("movers")
