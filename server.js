@@ -76,6 +76,26 @@ function formatDateLabel(isoOrMillis) {
   return date.toLocaleDateString("en-US", options)
 }
 
+/*
+  Crew type helpers — controls the "Crew Included" box on the listing card.
+  Stored in movers.crew_type as either "truck" or "labor_only".
+  Defaults to "truck" (Crew Included / Truck & equipment provided) when unset.
+*/
+const CREW_TYPE_LABELS = {
+  truck: {
+    label: "Crew Included",
+    sublabel: "Truck & equipment provided",
+  },
+  labor_only: {
+    label: "Labor Only",
+    sublabel: "Bring your own truck",
+  },
+}
+
+function getCrewLabels(crewType) {
+  return CREW_TYPE_LABELS[crewType] || CREW_TYPE_LABELS.truck
+}
+
 function mapProfileToMover(profileRow) {
   if (!profileRow) return {}
   return {
@@ -241,6 +261,8 @@ async function upsertSupabaseMoverFromProfile(profileRow) {
 /* ------------------------- Airtable shape mapper ------------------------- */
 
 function mapMoverToAirtableShape(mover) {
+  const crewLabels = getCrewLabels(mover.crew_type)
+
   return {
     id: mover.id,
     fields: {
@@ -270,6 +292,17 @@ function mapMoverToAirtableShape(mover) {
       Badge: mover.badge || "",
      ["Business Hours"]: mover.business_hours || "",
       ["Price Range"]: mover.price_range_max ? `$0–$${mover.price_range_max}` : "",
+      // How quickly the mover typically responds — editable from the dashboard.
+      // Falls back to a default phrase on the card when not set.
+      ["Response Time"]: mover.response_time || "",
+      // Verified badge subtitle shown under "PackRocket Verified" on the card.
+      // Editable by movers (or in Supabase directly); falls back to a default.
+      // NOTE: key must be "Verified Tagline" to match what PackRocketSearch.tsx reads.
+      ["Verified Tagline"]: mover.verified_subtitle || "Reliable movers • Customer favorite",
+      // Crew / truck box on the listing card. crew_type is "truck" (default) or "labor_only".
+      ["Crew Type"]: mover.crew_type || "truck",
+      ["Crew Label"]: crewLabels.label,
+      ["Crew Sublabel"]: crewLabels.sublabel,
       service_radius_miles: mover.service_radius_miles,
       _distanceMiles: mover._distanceMiles ?? null,
     },
@@ -1280,7 +1313,18 @@ app.get("/api/movers/:id", async (req, res) => {
 
 app.post("/api/update-listing", async (req, res) => {
   try {
-   const { email, description, features, service_areas, services, response_time, website, business_hours } = req.body || {}
+   const {
+     email,
+     description,
+     features,
+     service_areas,
+     services,
+     response_time,
+     website,
+     business_hours,
+     verified_subtitle,
+     crew_type,
+   } = req.body || {}
 
     if (!email) return res.status(400).json({ ok: false, error: "Missing email" })
 
@@ -1291,6 +1335,18 @@ app.post("/api/update-listing", async (req, res) => {
     if (services !== undefined) updates.services = Array.isArray(services) ? services.join(",") : services
     if (response_time !== undefined && response_time !== "") updates.response_time = response_time
 if (business_hours !== undefined && business_hours !== "") updates.business_hours = business_hours
+
+    // "PackRocket Verified" subtitle line — e.g. "Reliable movers • Customer favorite".
+    // Movers can customize this; empty string clears it back to the default.
+    if (verified_subtitle !== undefined) {
+      updates.verified_subtitle = String(verified_subtitle).slice(0, 80)
+    }
+
+    // Crew/truck box toggle: "truck" (Crew Included / Truck & equipment provided)
+    // or "labor_only" (Labor Only / Bring your own truck).
+    if (crew_type !== undefined) {
+      updates.crew_type = crew_type === "labor_only" ? "labor_only" : "truck"
+    }
 
     const { error } = await supabase
       .from("movers")
