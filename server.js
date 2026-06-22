@@ -265,6 +265,7 @@ function mapMoverToAirtableShape(mover) {
 
   return {
     id: mover.id,
+    createdTime: mover.created_at || null,
     fields: {
       Name: mover.name,
       Email: mover.email,
