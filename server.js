@@ -1187,14 +1187,23 @@ try {
       return res.json({ records })
     }
 
-    // Fallback text search
-    const qClean = qRaw.toLowerCase().trim()
-    const filtered = allMovers.filter((m) =>
-      (m.city  || "").toLowerCase().includes(qClean) ||
-      (m.state || "").toLowerCase().includes(qClean) ||
-      (m.name  || "").toLowerCase().includes(qClean) ||
-      (m.zip   || "").includes(qClean)
-    )
+// Fallback text search
+    const qClean = qRaw.toLowerCase().trim().replace(/,/g, "")
+    const qParts = qClean.split(/\s+/).filter(Boolean) // e.g. ["foley", "al"]
+
+    const filtered = allMovers.filter((m) => {
+      const mCity  = (m.city  || "").toLowerCase()
+      const mState = (m.state || "").toLowerCase()
+      const mName  = (m.name  || "").toLowerCase()
+      const mZip   = (m.zip   || "")
+
+      return (
+        (mCity  && qClean.includes(mCity)) ||
+        (mState && qParts.includes(mState)) ||
+        mName.includes(qClean) ||
+        (mZip && qClean.includes(mZip))
+      )
+    })
 
     return res.json({
       records: filtered.map((m) => mapMoverToAirtableShape(m)),
