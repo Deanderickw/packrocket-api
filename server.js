@@ -336,7 +336,7 @@ const PRICE_IDS = {
 app.use(
   cors({
     origin: "*",
-    methods: ["GET", "POST", "PUT", "PATCH", "OPTIONS"],
+    methods: ["GET", "POST", "PUT", "PATCH", "OPTIONS", "DELETE"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 )
@@ -767,7 +767,7 @@ app.get("/api/messages", async (req, res) => {
 
 app.post("/api/reviews", async (req, res) => {
   try {
-    const { moverId, customerName, rating, comment } = req.body || {}
+    const { moverId, customerId, customerName, rating, comment } = req.body || {}
     if (!moverId || !customerName || !rating) {
       return res.status(400).json({ ok: false, error: "Missing required fields" })
     }
@@ -779,6 +779,7 @@ app.post("/api/reviews", async (req, res) => {
       .from("reviews")
       .insert([{
         mover_id: moverId,
+        customer_id: customerId || null,
         customer_name: customerName,
         rating: Number(rating),
         comment: comment || "",
@@ -825,16 +826,32 @@ app.get("/api/reviews/:moverId", async (req, res) => {
 
     const { data, error } = await supabase
       .from("reviews")
-      .select("id, customer_name, rating, comment, created_at")
+      .select("id, customer_id, customer_name, rating, comment, created_at")
       .eq("mover_id", moverId)
       .order("created_at", { ascending: false })
       .limit(50)
 
     if (error) return res.json({ ok: true, reviews: [] })
 
+    // Pull avatars for any reviews that are linked to a real customer
+    // account, so the review can show the reviewer's actual photo.
+    const customerIds = [...new Set((data || []).map((r) => r.customer_id).filter(Boolean))]
+    let avatarsById = {}
+    if (customerIds.length) {
+      const { data: customerRows } = await supabase
+        .from("customers")
+        .select("id, avatar_url")
+        .in("id", customerIds)
+      avatarsById = Object.fromEntries((customerRows || []).map((c) => [c.id, c.avatar_url]))
+    }
+    const reviewsWithAvatars = (data || []).map((r) => ({
+      ...r,
+      customerAvatarUrl: r.customer_id ? avatarsById[r.customer_id] || "" : "",
+    }))
+
     const avg = data?.length ? data.reduce((s, r) => s + r.rating, 0) / data.length : 0
 
-    return res.json({ ok: true, reviews: data || [], averageRating: parseFloat(avg.toFixed(1)), totalReviews: data?.length || 0 })
+    return res.json({ ok: true, reviews: reviewsWithAvatars, averageRating: parseFloat(avg.toFixed(1)), totalReviews: data?.length || 0 })
   } catch (err) {
     console.error("/api/reviews/:moverId error:", err)
     return res.status(500).json({ ok: false, error: "Server error" })
@@ -1799,7 +1816,7 @@ app.post("/api/update-email", async (req, res) => {
   }
 }) 
 
-/* ── Support contact ── */
+/* -------------------- Support contact -------------------- */
 
 app.post("/api/support", async (req, res) => {
   try {
@@ -1818,6 +1835,390 @@ app.post("/api/support", async (req, res) => {
   } catch (err) {
     console.error("/api/support error:", err)
     return res.status(500).json({ ok: false })
+  }
+})
+
+/* ==========================================================================
+   CUSTOMER ACCOUNT ROUTES
+
+   These are intentionally SEPARATE from /api/signup, /api/login, and
+   /api/update-profile above — those three write to the `profiles` table,
+   which is mover-only (business_name, service_radius_miles, plan,
+   approval_status...). These use a separate `customers` table instead.
+   Run 1_supabase_migration.sql in Supabase before this will work — it
+   creates `customers`, `saved_movers`, and adds `customer_id` to `reviews`.
+
+   Auth model note: like the rest of this file (/api/update-profile,
+   /api/leads, etc.), these routes identify the customer by email in the
+   request body rather than a bearer token, matching the existing security
+   model of the app.
+   ========================================================================== */
+
+function mapCustomerToPublic(row) {
+  if (!row) return null
+  return {
+    id: row.id,
+    email: row.email,
+    fullName: row.full_name || "",
+    phone: row.phone || "",
+    avatarUrl: row.avatar_url || "",
+  }
+}
+
+/* ── Customer signup ── */
+app.post("/api/customer/signup", async (req, res) => {
+  try {
+    const { fullName, email, password } = req.body || {}
+    if (!email || !password) {
+      return res.status(400).json({ ok: false, code: "MISSING_FIELDS", error: "Please enter an email and password." })
+    }
+    if (String(password).length < 8) {
+      return res.status(400).json({ ok: false, code: "WEAK_PASSWORD", error: "Password must be at least 8 characters." })
+    }
+
+    const normalizedEmail = normalizeEmail(email)
+
+    const { data: existingCustomer } = await supabase
+      .from("customers")
+      .select("id")
+      .eq("email", normalizedEmail)
+      .maybeSingle()
+    if (existingCustomer) {
+      return res.status(400).json({ ok: false, code: "EMAIL_IN_USE", error: "An account with this email already exists. Please log in instead." })
+    }
+
+    const { data: existingMover } = await supabase
+      .from("profiles")
+      .select("id")
+      .eq("email", normalizedEmail)
+      .maybeSingle()
+    if (existingMover) {
+      return res.status(400).json({ ok: false, code: "EMAIL_IS_MOVER", error: "This email is registered as a mover partner account. Please use a different email for your customer account." })
+    }
+
+    const { data: authUser, error: authErr } = await supabase.auth.admin.createUser({
+      email: normalizedEmail,
+      password,
+      email_confirm: true,
+    })
+
+    if (authErr || !authUser?.user) {
+      const msg = String(authErr?.message || "").toLowerCase()
+      const alreadyExists = msg.includes("already") || msg.includes("exists") || msg.includes("registered") || msg.includes("duplicate")
+      return res.status(400).json({
+        ok: false,
+        code: alreadyExists ? "EMAIL_IN_USE" : "SIGNUP_FAILED",
+        error: alreadyExists
+          ? "This email already has a PackRocket account. Try logging in instead."
+          : "We couldn't create your account. Please try again.",
+      })
+    }
+
+    const user = authUser.user
+
+    const { data: customerRow, error: insertErr } = await supabase
+      .from("customers")
+      .insert([{
+        id: user.id,
+        email: normalizedEmail,
+        full_name: fullName || "",
+      }])
+      .select("*")
+      .single()
+
+    if (insertErr) {
+      try { await supabase.auth.admin.deleteUser(user.id) } catch {}
+      return res.status(400).json({ ok: false, code: "PROFILE_UPSERT_FAILED", error: "We couldn't finish setting up your account. Please try again." })
+    }
+
+    return res.json({ ok: true, customer: mapCustomerToPublic(customerRow) })
+  } catch (err) {
+    console.error("/api/customer/signup error:", err)
+    return res.status(500).json({ ok: false, code: "SIGNUP_FAILED", error: "Signup failed. Please try again." })
+  }
+})
+
+/* ── Customer login ── */
+app.post("/api/customer/login", async (req, res) => {
+  try {
+    const { email, password } = req.body || {}
+    if (!email || !password) return res.status(400).json({ ok: false, error: "Missing fields" })
+
+    const normalizedEmail = normalizeEmail(email)
+    const { data, error } = await getSupabaseAuth().auth.signInWithPassword({ email: normalizedEmail, password })
+
+    if (error || !data?.user) {
+      const msg = String(error?.message || "").toLowerCase()
+      const badCreds = msg.includes("invalid") || msg.includes("credentials") || msg.includes("password") || msg.includes("not found")
+      return res.status(400).json({
+        ok: false,
+        error: badCreds ? "Incorrect email or password. Please try again." : "Login failed. Please try again.",
+      })
+    }
+
+    const { data: customerRow } = await supabase
+      .from("customers")
+      .select("*")
+      .eq("id", data.user.id)
+      .maybeSingle()
+
+    if (!customerRow) {
+      // This account exists in Supabase auth but has no customer profile —
+      // most likely it's a mover account trying to log into the customer flow.
+      return res.status(400).json({ ok: false, error: "We couldn't find a customer account for this email." })
+    }
+
+    return res.json({ ok: true, customer: mapCustomerToPublic(customerRow) })
+  } catch (err) {
+    console.error("/api/customer/login error:", err)
+    return res.status(500).json({ ok: false, error: "Server error" })
+  }
+})
+
+/* ── Update customer profile ── */
+app.post("/api/customer/update-profile", async (req, res) => {
+  try {
+    const { email, fullName, phone } = req.body || {}
+    if (!email) return res.status(400).json({ ok: false, error: "Missing email" })
+
+    const updates = { updated_at: new Date().toISOString() }
+    if (fullName !== undefined) updates.full_name = fullName
+    if (phone !== undefined) updates.phone = phone
+
+    const { data, error } = await supabase
+      .from("customers")
+      .update(updates)
+      .eq("email", normalizeEmail(email))
+      .select("*")
+      .single()
+
+    if (error || !data) return res.status(500).json({ ok: false, error: "Failed to update profile" })
+
+    return res.json({ ok: true, customer: mapCustomerToPublic(data) })
+  } catch (err) {
+    console.error("/api/customer/update-profile error:", err)
+    return res.status(500).json({ ok: false, error: "Server error" })
+  }
+})
+
+/* ── Upload customer avatar ── */
+app.post("/api/customer/avatar", upload.single("file"), async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body.email)
+    const file = req.file
+    if (!email) return res.status(400).json({ ok: false, error: "Missing email" })
+    if (!file) return res.status(400).json({ ok: false, error: "Missing file" })
+
+    const ext = (file.originalname || "avatar.jpg").split(".").pop()
+    const safeEmail = email.replace(/[^a-zA-Z0-9@._-]/g, "_")
+    const filePath = `customers/${safeEmail}/${Date.now()}-avatar.${ext}`
+
+    const { error: uploadError } = await supabase.storage
+      .from(LOGO_BUCKET)
+      .upload(filePath, file.buffer, {
+        contentType: file.mimetype || "image/jpeg",
+        upsert: false,
+      })
+
+    if (uploadError) return res.status(500).json({ ok: false, error: "Failed to upload photo" })
+
+    const { data: { publicUrl } } = supabase.storage.from(LOGO_BUCKET).getPublicUrl(filePath)
+    if (!publicUrl) return res.status(500).json({ ok: false, error: "Could not get public URL" })
+
+    await supabase.from("customers").update({ avatar_url: publicUrl, updated_at: new Date().toISOString() }).eq("email", email)
+
+    return res.json({ ok: true, url: publicUrl })
+  } catch (err) {
+    console.error("/api/customer/avatar error:", err)
+    return res.status(500).json({ ok: false, error: "Server error" })
+  }
+})
+
+/* ── Delete customer account ── */
+app.post("/api/customer/delete-account", async (req, res) => {
+  try {
+    const { email } = req.body || {}
+    if (!email) return res.status(400).json({ ok: false, error: "Missing email" })
+
+    const normalizedEmail = normalizeEmail(email)
+    const { data: customerRow } = await supabase
+      .from("customers")
+      .select("id")
+      .eq("email", normalizedEmail)
+      .maybeSingle()
+
+    if (!customerRow) return res.status(404).json({ ok: false, error: "Account not found" })
+
+    await supabase.from("saved_movers").delete().eq("customer_id", customerRow.id)
+    await supabase.from("customers").delete().eq("id", customerRow.id)
+    try { await supabase.auth.admin.deleteUser(customerRow.id) } catch (e) {
+      console.warn("Auth user delete failed (non-fatal):", e?.message)
+    }
+
+    return res.json({ ok: true })
+  } catch (err) {
+    console.error("/api/customer/delete-account error:", err)
+    return res.status(500).json({ ok: false, error: "Server error" })
+  }
+})
+
+/* ── Saved movers: list ── */
+app.get("/api/customer/saved-movers", async (req, res) => {
+  try {
+    const email = normalizeEmail(req.query.email)
+    if (!email) return res.status(400).json({ ok: false, error: "Missing email" })
+
+    const { data: customerRow } = await supabase
+      .from("customers")
+      .select("id")
+      .eq("email", email)
+      .maybeSingle()
+    if (!customerRow) return res.json({ ok: true, movers: [] })
+
+    const { data: saved, error } = await supabase
+      .from("saved_movers")
+      .select("id, mover_id, created_at")
+      .eq("customer_id", customerRow.id)
+      .order("created_at", { ascending: false })
+
+    if (error || !saved?.length) return res.json({ ok: true, movers: [] })
+
+    const moverIds = saved.map((s) => s.mover_id)
+    const { data: movers } = await supabase
+      .from("movers")
+      .select("*")
+      .in("id", moverIds)
+
+    const moversById = Object.fromEntries((movers || []).map((m) => [m.id, m]))
+    const results = saved
+      .filter((s) => moversById[s.mover_id])
+      .map((s) => mapMoverToAirtableShape(moversById[s.mover_id]))
+
+    return res.json({ ok: true, movers: results })
+  } catch (err) {
+    console.error("/api/customer/saved-movers GET error:", err)
+    return res.status(500).json({ ok: false, error: "Server error" })
+  }
+})
+
+/* ── Saved movers: add ── */
+app.post("/api/customer/saved-movers", async (req, res) => {
+  try {
+    const { email, moverId } = req.body || {}
+    if (!email || !moverId) return res.status(400).json({ ok: false, error: "Missing email or moverId" })
+
+    const { data: customerRow } = await supabase
+      .from("customers")
+      .select("id")
+      .eq("email", normalizeEmail(email))
+      .maybeSingle()
+    if (!customerRow) return res.status(404).json({ ok: false, error: "Account not found" })
+
+    const { error } = await supabase
+      .from("saved_movers")
+      .upsert([{ customer_id: customerRow.id, mover_id: moverId }], { onConflict: "customer_id,mover_id" })
+
+    if (error) return res.status(500).json({ ok: false, error: "Failed to save mover" })
+
+    return res.json({ ok: true })
+  } catch (err) {
+    console.error("/api/customer/saved-movers POST error:", err)
+    return res.status(500).json({ ok: false, error: "Server error" })
+  }
+})
+
+/* ── Saved movers: remove ── */
+app.delete("/api/customer/saved-movers", async (req, res) => {
+  try {
+    const { email, moverId } = req.body || {}
+    if (!email || !moverId) return res.status(400).json({ ok: false, error: "Missing email or moverId" })
+
+    const { data: customerRow } = await supabase
+      .from("customers")
+      .select("id")
+      .eq("email", normalizeEmail(email))
+      .maybeSingle()
+    if (!customerRow) return res.status(404).json({ ok: false, error: "Account not found" })
+
+    await supabase
+      .from("saved_movers")
+      .delete()
+      .eq("customer_id", customerRow.id)
+      .eq("mover_id", moverId)
+
+    return res.json({ ok: true })
+  } catch (err) {
+    console.error("/api/customer/saved-movers DELETE error:", err)
+    return res.status(500).json({ ok: false, error: "Server error" })
+  }
+})
+
+/* ── Shared helper: fetch this customer's leads (used for both
+   "upcoming moves" and "messages", since they're the same underlying
+   leads table — a lead is created any time a customer sends a request
+   or message to a mover via /api/leads or /api/message). ── */
+async function fetchCustomerLeads(email) {
+  const { data: leadsRows, error } = await supabase
+    .from("leads")
+    .select("id, mover_id, move_date, pickup_address, dropoff_address, home_size, notes, sent_status, sent_at, created_at")
+    .ilike("customer_email", email)
+    .order("created_at", { ascending: false })
+    .limit(100)
+
+  if (error || !leadsRows?.length) return []
+
+  const moverIds = [...new Set(leadsRows.map((l) => l.mover_id).filter(Boolean))]
+  const { data: movers } = moverIds.length
+    ? await supabase.from("profiles").select("id, business_name, full_name, logo_url").in("id", moverIds)
+    : { data: [] }
+  const moversById = Object.fromEntries((movers || []).map((m) => [m.id, m]))
+
+  return leadsRows.map((l) => {
+    const mover = moversById[l.mover_id]
+    return {
+      id: l.id,
+      moverId: l.mover_id,
+      moverName: mover ? (mover.business_name || mover.full_name || "Mover") : "Mover",
+      moverLogo: mover?.logo_url || "",
+      moveDate: l.move_date,
+      pickupAddress: l.pickup_address,
+      dropoffAddress: l.dropoff_address,
+      homeSize: l.home_size,
+      notes: l.notes,
+      sentStatus: l.sent_status,
+      createdAt: l.created_at,
+    }
+  })
+}
+
+/* ── Upcoming / past moves ── */
+app.get("/api/customer/moves", async (req, res) => {
+  try {
+    const email = normalizeEmail(req.query.email)
+    if (!email) return res.status(400).json({ ok: false, error: "Missing email" })
+    const leads = await fetchCustomerLeads(email)
+    const today = new Date().toISOString().slice(0, 10)
+    return res.json({
+      ok: true,
+      upcoming: leads.filter((l) => l.moveDate && l.moveDate >= today),
+      past: leads.filter((l) => !l.moveDate || l.moveDate < today),
+    })
+  } catch (err) {
+    console.error("/api/customer/moves error:", err)
+    return res.status(500).json({ ok: false, error: "Server error" })
+  }
+})
+
+/* ── Recent messages / requests sent by this customer ── */
+app.get("/api/customer/messages", async (req, res) => {
+  try {
+    const email = normalizeEmail(req.query.email)
+    if (!email) return res.status(400).json({ ok: false, error: "Missing email" })
+    const leads = await fetchCustomerLeads(email)
+    return res.json({ ok: true, messages: leads })
+  } catch (err) {
+    console.error("/api/customer/messages error:", err)
+    return res.status(500).json({ ok: false, error: "Server error" })
   }
 })
 
