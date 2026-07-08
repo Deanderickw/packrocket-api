@@ -2222,6 +2222,105 @@ app.get("/api/customer/messages", async (req, res) => {
   }
 })
 
+/* ── Reviews left by this customer (across all movers) ── */
+app.get("/api/customer/reviews", async (req, res) => {
+  try {
+    const email = normalizeEmail(req.query.email)
+    if (!email) return res.status(400).json({ ok: false, error: "Missing email" })
+
+    const { data: customerRow } = await supabase
+      .from("customers")
+      .select("id")
+      .eq("email", email)
+      .maybeSingle()
+    if (!customerRow) return res.json({ ok: true, reviews: [] })
+
+    const { data: reviewRows, error } = await supabase
+      .from("reviews")
+      .select("id, mover_id, rating, comment, created_at")
+      .eq("customer_id", customerRow.id)
+      .order("created_at", { ascending: false })
+
+    if (error || !reviewRows?.length) return res.json({ ok: true, reviews: [] })
+
+    const moverIds = [...new Set(reviewRows.map((r) => r.mover_id).filter(Boolean))]
+    const { data: movers } = moverIds.length
+      ? await supabase.from("movers").select("id, name, logo_url").in("id", moverIds)
+      : { data: [] }
+    const moversById = Object.fromEntries((movers || []).map((m) => [m.id, m]))
+
+    const reviews = reviewRows.map((r) => ({
+      id: r.id,
+      moverId: r.mover_id,
+      moverName: moversById[r.mover_id]?.name || "Mover",
+      moverLogo: moversById[r.mover_id]?.logo_url || "",
+      rating: r.rating,
+      comment: r.comment,
+      createdAt: r.created_at,
+    }))
+
+    return res.json({ ok: true, reviews })
+  } catch (err) {
+    console.error("/api/customer/reviews error:", err)
+    return res.status(500).json({ ok: false, error: "Server error" })
+  }
+})
+
+/* ── Edit an existing review (only the customer who wrote it) ── */
+app.post("/api/reviews/:id/update", async (req, res) => {
+  try {
+    const { id } = req.params
+    const { email, rating, comment } = req.body || {}
+    if (!id || !email) return res.status(400).json({ ok: false, error: "Missing id or email" })
+    if (rating !== undefined && (rating < 1 || rating > 5)) {
+      return res.status(400).json({ ok: false, error: "Rating must be 1-5" })
+    }
+
+    const { data: customerRow } = await supabase
+      .from("customers")
+      .select("id")
+      .eq("email", normalizeEmail(email))
+      .maybeSingle()
+    if (!customerRow) return res.status(404).json({ ok: false, error: "Account not found" })
+
+    const { data: existingReview } = await supabase
+      .from("reviews")
+      .select("id, mover_id, customer_id")
+      .eq("id", id)
+      .maybeSingle()
+    if (!existingReview) return res.status(404).json({ ok: false, error: "Review not found" })
+    if (existingReview.customer_id !== customerRow.id) {
+      return res.status(403).json({ ok: false, error: "You can only edit your own reviews" })
+    }
+
+    const updates = {}
+    if (rating !== undefined) updates.rating = Number(rating)
+    if (comment !== undefined) updates.comment = comment
+
+    const { error } = await supabase.from("reviews").update(updates).eq("id", id)
+    if (error) return res.status(500).json({ ok: false, error: "Failed to update review" })
+
+    // Re-average the mover's rating since this review's score may have changed.
+    try {
+      const { data: allReviews } = await supabase
+        .from("reviews")
+        .select("rating")
+        .eq("mover_id", existingReview.mover_id)
+      if (allReviews?.length) {
+        const avg = allReviews.reduce((s, r) => s + r.rating, 0) / allReviews.length
+        await supabase.from("movers").update({ rating: parseFloat(avg.toFixed(1)) }).eq("id", existingReview.mover_id)
+      }
+    } catch (ratingErr) {
+      console.error("Rating sync failed:", ratingErr?.message)
+    }
+
+    return res.json({ ok: true })
+  } catch (err) {
+    console.error("/api/reviews/:id/update error:", err)
+    return res.status(500).json({ ok: false, error: "Server error" })
+  }
+})
+
 app.listen(PORT, () => {
   console.log(`✅ PackRocket API running on :${PORT}`)
 })
