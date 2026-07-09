@@ -458,6 +458,13 @@ app.post(
 /* --------------------- JSON middleware ------------------ */
 
 app.use(express.json())
+// Needed to parse the form-encoded body navigator.sendBeacon() sends for
+// view tracking (see /api/customer/mover-view) — sendBeacon with a JSON
+// Blob isn't a CORS-safelisted content type for cross-origin requests, so
+// URLSearchParams (application/x-www-form-urlencoded) is used instead,
+// which needs this parser. Doesn't affect any existing JSON routes, since
+// each body parser only engages for its own matching Content-Type.
+app.use(express.urlencoded({ extended: true }))
 
 /* ------------------------ Health check ------------------------ */
 
