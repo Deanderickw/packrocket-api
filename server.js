@@ -2168,18 +2168,33 @@ async function fetchCustomerLeads(email) {
   if (error || !leadsRows?.length) return []
 
   const moverIds = [...new Set(leadsRows.map((l) => l.mover_id).filter(Boolean))]
-  const { data: movers } = moverIds.length
-    ? await supabase.from("profiles").select("id, business_name, full_name, logo_url").in("id", moverIds)
+  const { data: profileRows } = moverIds.length
+    ? await supabase.from("profiles").select("id, business_name, full_name, logo_url, phone_e164, email").in("id", moverIds)
     : { data: [] }
-  const moversById = Object.fromEntries((movers || []).map((m) => [m.id, m]))
+  const profilesById = Object.fromEntries((profileRows || []).map((m) => [m.id, m]))
+
+  // profiles (mover accounts) and movers (public listing rows with
+  // hero photo / verified / rating) are separate tables kept in sync by
+  // email — join through that to get the listing-facing fields.
+  const moverEmails = [...new Set((profileRows || []).map((m) => m.email).filter(Boolean))]
+  const { data: listingRows } = moverEmails.length
+    ? await supabase.from("movers").select("email, hero_photo_url, verified").in("email", moverEmails)
+    : { data: [] }
+  const listingByEmail = Object.fromEntries(
+    (listingRows || []).map((m) => [String(m.email || "").toLowerCase(), m])
+  )
 
   return leadsRows.map((l) => {
-    const mover = moversById[l.mover_id]
+    const mover = profilesById[l.mover_id]
+    const listing = mover?.email ? listingByEmail[String(mover.email).toLowerCase()] : null
     return {
       id: l.id,
       moverId: l.mover_id,
       moverName: mover ? (mover.business_name || mover.full_name || "Mover") : "Mover",
       moverLogo: mover?.logo_url || "",
+      moverPhoto: listing?.hero_photo_url || "",
+      moverVerified: !!listing?.verified,
+      moverPhone: mover?.phone_e164 || "",
       moveDate: l.move_date,
       pickupAddress: l.pickup_address,
       dropoffAddress: l.dropoff_address,
@@ -2317,6 +2332,73 @@ app.post("/api/reviews/:id/update", async (req, res) => {
     return res.json({ ok: true })
   } catch (err) {
     console.error("/api/reviews/:id/update error:", err)
+    return res.status(500).json({ ok: false, error: "Server error" })
+  }
+})
+
+/* ── Track a mover profile view (call this when a logged-in customer
+   opens a mover's profile) ── */
+app.post("/api/customer/mover-view", async (req, res) => {
+  try {
+    const { email, moverId } = req.body || {}
+    if (!email || !moverId) return res.status(400).json({ ok: false, error: "Missing email or moverId" })
+
+    const { data: customerRow } = await supabase
+      .from("customers")
+      .select("id")
+      .eq("email", normalizeEmail(email))
+      .maybeSingle()
+    if (!customerRow) return res.json({ ok: true }) // guests just no-op, not an error
+
+    const { error } = await supabase
+      .from("mover_views")
+      .upsert(
+        [{ customer_id: customerRow.id, mover_id: moverId, viewed_at: new Date().toISOString() }],
+        { onConflict: "customer_id,mover_id" }
+      )
+    if (error) return res.status(500).json({ ok: false, error: "Failed to record view" })
+
+    return res.json({ ok: true })
+  } catch (err) {
+    console.error("/api/customer/mover-view error:", err)
+    return res.status(500).json({ ok: false, error: "Server error" })
+  }
+})
+
+/* ── Recently viewed movers ── */
+app.get("/api/customer/recently-viewed", async (req, res) => {
+  try {
+    const email = normalizeEmail(req.query.email)
+    if (!email) return res.status(400).json({ ok: false, error: "Missing email" })
+
+    const { data: customerRow } = await supabase
+      .from("customers")
+      .select("id")
+      .eq("email", email)
+      .maybeSingle()
+    if (!customerRow) return res.json({ ok: true, movers: [] })
+
+    const { data: viewRows, error } = await supabase
+      .from("mover_views")
+      .select("mover_id, viewed_at")
+      .eq("customer_id", customerRow.id)
+      .order("viewed_at", { ascending: false })
+      .limit(10)
+
+    if (error || !viewRows?.length) return res.json({ ok: true, movers: [] })
+
+    const moverIds = viewRows.map((v) => v.mover_id)
+    const { data: movers } = await supabase.from("movers").select("*").in("id", moverIds)
+    const moversById = Object.fromEntries((movers || []).map((m) => [m.id, m]))
+
+    // Preserve most-recently-viewed-first order
+    const results = viewRows
+      .filter((v) => moversById[v.mover_id])
+      .map((v) => mapMoverToAirtableShape(moversById[v.mover_id]))
+
+    return res.json({ ok: true, movers: results })
+  } catch (err) {
+    console.error("/api/customer/recently-viewed error:", err)
     return res.status(500).json({ ok: false, error: "Server error" })
   }
 })
