@@ -1975,6 +1975,31 @@ app.post("/api/customer/login", async (req, res) => {
   }
 })
 
+/* ── Refresh session from the database. Called on every app load to
+   correct any stale cached session (e.g. an avatar upload whose result
+   never made it back to localStorage because the tab navigated away
+   mid-request) — the cache is a starting point, this is the source of
+   truth. ── */
+app.get("/api/customer/me", async (req, res) => {
+  try {
+    const email = normalizeEmail(req.query.email)
+    if (!email) return res.status(400).json({ ok: false, error: "Missing email" })
+
+    const { data: customerRow } = await supabase
+      .from("customers")
+      .select("*")
+      .eq("email", email)
+      .maybeSingle()
+
+    if (!customerRow) return res.status(404).json({ ok: false, error: "Account not found" })
+
+    return res.json({ ok: true, customer: mapCustomerToPublic(customerRow) })
+  } catch (err) {
+    console.error("/api/customer/me error:", err)
+    return res.status(500).json({ ok: false, error: "Server error" })
+  }
+})
+
 /* ── Update customer profile ── */
 app.post("/api/customer/update-profile", async (req, res) => {
   try {
