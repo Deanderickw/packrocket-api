@@ -586,6 +586,21 @@ app.post("/api/leads", async (req, res) => {
       else leadId = leadRow?.id
     }
 
+    // Seed the message thread with the customer's opening note, if any,
+    // so the mover's in-app conversation view has the original request
+    // as the first bubble (mirrors what's in the notification email).
+    if (leadId && notes) {
+      try {
+        await supabase.from("lead_messages").insert([{
+          lead_id: leadId,
+          sender_type: "customer",
+          body: notes,
+        }])
+      } catch (threadErr) {
+        console.error("Thread seed error (non-fatal):", threadErr?.message)
+      }
+    }
+
     const subject = `New PackRocket Move Request — ${customerName} (${moveDate})`
     const text =
       `New PackRocket Move Request\n\n` +
@@ -598,7 +613,8 @@ app.post("/api/leads", async (req, res) => {
       (dropoffAddress ? `Dropoff: ${dropoffAddress}\n` : "") +
       (homeSize ? `Home Size: ${homeSize}\n` : "") +
       (notes ? `Notes: ${notes}\n` : "") +
-      (leadId ? `\nLead ID: ${leadId}\n` : "")
+      (leadId ? `\nLead ID: ${leadId}\n` : "") +
+      `\nReply to this customer any time from your PackRocket dashboard — Messages tab.\n`
 
     const emailResult = await resend.emails.send({
       from: "PackRocket Leads <leads@packrocket.co>",
@@ -633,6 +649,7 @@ app.post("/api/message", async (req, res) => {
       moverEmail: providedEmail,
       customerName,
       customerPhone,
+      customerEmail,
       message,
       pickupCity,
       dropoffCity,
@@ -707,32 +724,57 @@ app.post("/api/message", async (req, res) => {
         (dropoffCity ? `Drop-off: ${dropoffCity}\n` : "") +
         (message ? `\nMessage:\n"${message}"\n` : "") +
         `────────────────────────\n\n` +
-        `Reply directly to this customer by calling or texting ${customerPhone}.\n\n` +
+        `Reply directly to this customer any time from your PackRocket dashboard — Messages tab, ` +
+        `or call/text ${customerPhone}.\n\n` +
         `– The PackRocket Team\nhttps://packrocket.co`,
     })
 
+    // leadId is returned to the client so the message modal can hand it
+    // to a conversation thread view (GET/POST /api/leads/:id/messages)
+    // immediately after sending, instead of needing a page refresh.
+    let leadId = null
     try {
       if (messageSupabaseMoverId) {
-        await supabase.from("leads").insert([{
-          mover_id: messageSupabaseMoverId,
-          customer_name: customerName,
-          customer_phone: customerPhone,
-          customer_email: null,
-          move_date: null,
-          pickup_address: pickupCity || null,
-          dropoff_address: dropoffCity || null,
-          home_size: null,
-          notes: message || null,
-          sent_status: "sent",
-          sent_at: new Date().toISOString(),
-          created_at: new Date().toISOString(),
-        }])
+        const { data: leadRow, error: leadErr } = await supabase
+          .from("leads")
+          .insert([{
+            mover_id: messageSupabaseMoverId,
+            customer_name: customerName,
+            customer_phone: customerPhone,
+            customer_email: customerEmail || null,
+            move_date: null,
+            pickup_address: pickupCity || null,
+            dropoff_address: dropoffCity || null,
+            home_size: null,
+            notes: message || null,
+            sent_status: "sent",
+            sent_at: new Date().toISOString(),
+            created_at: new Date().toISOString(),
+          }])
+          .select("id")
+          .single()
+        if (leadErr) console.error("Lead save error (non-fatal):", leadErr?.message)
+        else leadId = leadRow?.id
       }
     } catch (leadErr) {
       console.error("Lead save error (non-fatal):", leadErr?.message)
     }
 
-    return res.json({ ok: true })
+    // Seed the thread with the opening message so the mover's reply view
+    // shows the original text as the first bubble in the conversation.
+    if (leadId && message) {
+      try {
+        await supabase.from("lead_messages").insert([{
+          lead_id: leadId,
+          sender_type: "customer",
+          body: message,
+        }])
+      } catch (threadErr) {
+        console.error("Thread seed error (non-fatal):", threadErr?.message)
+      }
+    }
+
+    return res.json({ ok: true, leadId })
   } catch (err) {
     console.error("/api/message error:", err)
     return res.status(500).json({ ok: false, error: "Server error" })
@@ -763,9 +805,227 @@ app.get("/api/messages", async (req, res) => {
 
     if (error) return res.json({ ok: true, messages: [] })
 
-    return res.json({ ok: true, messages: leads || [] })
+    // Attach thread metadata (last message preview + unread-from-customer
+    // count) so the dashboard can show a live conversation snippet and a
+    // badge without a second round trip per lead.
+    const leadIds = (leads || []).map((l) => l.id)
+    let lastByLead = {}
+    let unreadByLead = {}
+    if (leadIds.length) {
+      const { data: threadRows } = await supabase
+        .from("lead_messages")
+        .select("lead_id, sender_type, body, created_at, read_at")
+        .in("lead_id", leadIds)
+        .order("created_at", { ascending: true })
+
+      for (const m of threadRows || []) {
+        lastByLead[m.lead_id] = m
+        if (m.sender_type === "customer" && !m.read_at) {
+          unreadByLead[m.lead_id] = (unreadByLead[m.lead_id] || 0) + 1
+        }
+      }
+    }
+
+    const withThread = (leads || []).map((l) => ({
+      ...l,
+      lastMessage: lastByLead[l.id]
+        ? { body: lastByLead[l.id].body, senderType: lastByLead[l.id].sender_type, createdAt: lastByLead[l.id].created_at }
+        : null,
+      unreadCount: unreadByLead[l.id] || 0,
+    }))
+
+    return res.json({ ok: true, messages: withThread })
   } catch (err) {
     console.error("/api/messages error:", err)
+    return res.status(500).json({ ok: false, error: "Server error" })
+  }
+})
+
+/* ==========================================================================
+   TWO-WAY MESSAGE THREADS (lead_messages)
+
+   Requires this table in Supabase (run once):
+
+   create table if not exists lead_messages (
+     id uuid primary key default gen_random_uuid(),
+     lead_id uuid references leads(id) on delete cascade,
+     sender_type text not null check (sender_type in ('customer','mover')),
+     body text not null,
+     created_at timestamptz not null default now(),
+     read_at timestamptz
+   );
+   create index if not exists lead_messages_lead_id_idx on lead_messages(lead_id);
+
+   A "lead" (created by /api/leads or /api/message) is the conversation —
+   every reply from either side is a row here, threaded under that lead.
+   Movers keep getting an email for every new customer message; customers
+   get an email for every mover reply too, so nobody has to have the app
+   open to know they got a response.
+   ========================================================================== */
+
+// Loads a lead plus the mover/customer contact info needed to authorize
+// a request and to send notification emails.
+async function loadLeadWithContacts(leadId) {
+  const { data: lead } = await supabase
+    .from("leads")
+    .select("id, mover_id, customer_name, customer_phone, customer_email, notes, move_date, created_at")
+    .eq("id", leadId)
+    .maybeSingle()
+  if (!lead) return null
+
+  let moverEmail = "", moverName = "Mover"
+  const { data: moverProfile } = await supabase
+    .from("profiles")
+    .select("email, business_name, full_name")
+    .eq("id", lead.mover_id)
+    .maybeSingle()
+  if (moverProfile) {
+    moverEmail = moverProfile.email || ""
+    moverName = moverProfile.business_name || moverProfile.full_name || "Mover"
+  } else {
+    const { data: moverRow } = await supabase
+      .from("movers")
+      .select("email, name")
+      .eq("id", lead.mover_id)
+      .maybeSingle()
+    if (moverRow) {
+      moverEmail = moverRow.email || ""
+      moverName = moverRow.name || "Mover"
+    }
+  }
+
+  return { lead, moverEmail, moverName }
+}
+
+/* ── Get the full message thread for a lead ──
+   Callers identify themselves with ?email=; movers pass their account
+   email, customers pass the email tied to the lead. Marks the other
+   side's messages as read as a side effect (e.g. mover opening the
+   thread marks the customer's messages read, and vice versa). */
+app.get("/api/leads/:id/messages", async (req, res) => {
+  try {
+    const { id } = req.params
+    const email = normalizeEmail(req.query.email)
+    if (!id || !email) return res.status(400).json({ ok: false, error: "Missing id or email" })
+
+    const ctx = await loadLeadWithContacts(id)
+    if (!ctx) return res.status(404).json({ ok: false, error: "Conversation not found" })
+    const { lead, moverEmail, moverName } = ctx
+
+    const isMover = moverEmail && email === moverEmail
+    const isCustomer = lead.customer_email && email === normalizeEmail(lead.customer_email)
+    if (!isMover && !isCustomer) {
+      return res.status(403).json({ ok: false, error: "Not authorized to view this conversation" })
+    }
+
+    const { data: rows, error } = await supabase
+      .from("lead_messages")
+      .select("id, sender_type, body, created_at, read_at")
+      .eq("lead_id", id)
+      .order("created_at", { ascending: true })
+
+    if (error) return res.status(500).json({ ok: false, error: "Failed to load messages" })
+
+    // Mark the counterparty's unread messages as read now that this
+    // side has fetched the thread.
+    const unreadSenderType = isMover ? "customer" : "mover"
+    const unreadIds = (rows || [])
+      .filter((m) => m.sender_type === unreadSenderType && !m.read_at)
+      .map((m) => m.id)
+    if (unreadIds.length) {
+      await supabase.from("lead_messages").update({ read_at: new Date().toISOString() }).in("id", unreadIds)
+    }
+
+    return res.json({
+      ok: true,
+      lead: {
+        id: lead.id,
+        moverName,
+        customerName: lead.customer_name,
+        customerPhone: lead.customer_phone,
+        moveDate: lead.move_date,
+      },
+      viewerRole: isMover ? "mover" : "customer",
+      messages: rows || [],
+    })
+  } catch (err) {
+    console.error("/api/leads/:id/messages GET error:", err)
+    return res.status(500).json({ ok: false, error: "Server error" })
+  }
+})
+
+/* ── Post a reply into a lead's thread — used by both the mover
+   dashboard and the customer app, distinguished by which email
+   matches the lead. ── */
+app.post("/api/leads/:id/messages", async (req, res) => {
+  try {
+    const { id } = req.params
+    const { email, body } = req.body || {}
+    const trimmedBody = String(body || "").trim()
+    if (!id || !email || !trimmedBody) {
+      return res.status(400).json({ ok: false, error: "Missing id, email, or message body" })
+    }
+
+    const ctx = await loadLeadWithContacts(id)
+    if (!ctx) return res.status(404).json({ ok: false, error: "Conversation not found" })
+    const { lead, moverEmail, moverName } = ctx
+
+    const normalizedEmail = normalizeEmail(email)
+    const isMover = moverEmail && normalizedEmail === normalizeEmail(moverEmail)
+    const isCustomer = lead.customer_email && normalizedEmail === normalizeEmail(lead.customer_email)
+    if (!isMover && !isCustomer) {
+      return res.status(403).json({ ok: false, error: "Not authorized to reply in this conversation" })
+    }
+
+    const senderType = isMover ? "mover" : "customer"
+
+    const { data: inserted, error } = await supabase
+      .from("lead_messages")
+      .insert([{ lead_id: id, sender_type: senderType, body: trimmedBody }])
+      .select("id, sender_type, body, created_at")
+      .single()
+
+    if (error) return res.status(500).json({ ok: false, error: "Failed to send message" })
+
+    // Bump sent_status so mover-side lead lists reflect an active thread.
+    await supabase.from("leads").update({ sent_status: "sent" }).eq("id", id)
+
+    // Email the OTHER party so nobody has to keep the app open to
+    // know they got a reply — mover replies email the customer,
+    // customer replies (still) email the mover, same as before.
+    try {
+      if (senderType === "mover" && lead.customer_email) {
+        await resend.emails.send({
+          from: "PackRocket <leads@packrocket.co>",
+          to: [lead.customer_email],
+          subject: `💬 New reply from ${moverName} on PackRocket`,
+          text:
+            `${moverName} replied to your move request on PackRocket:\n\n` +
+            `"${trimmedBody}"\n\n` +
+            `Log in to PackRocket and open Messages to reply.\n\n` +
+            `– The PackRocket Team\nhttps://packrocket.co`,
+        })
+      } else if (senderType === "customer" && moverEmail) {
+        await resend.emails.send({
+          from: "PackRocket <leads@packrocket.co>",
+          to: [moverEmail],
+          bcc: process.env.LEADS_BCC_EMAIL ? [process.env.LEADS_BCC_EMAIL] : undefined,
+          subject: `💬 New reply from ${lead.customer_name} on PackRocket`,
+          text:
+            `${lead.customer_name} replied to your conversation on PackRocket:\n\n` +
+            `"${trimmedBody}"\n\n` +
+            `Reply any time from your PackRocket dashboard — Messages tab, ` +
+            `or call/text ${lead.customer_phone}.\n\n` +
+            `– The PackRocket Team\nhttps://packrocket.co`,
+        })
+      }
+    } catch (emailErr) {
+      console.error("Reply notification email failed (non-fatal):", emailErr?.message)
+    }
+
+    return res.json({ ok: true, message: inserted })
+  } catch (err) {
+    console.error("/api/leads/:id/messages POST error:", err)
     return res.status(500).json({ ok: false, error: "Server error" })
   }
 })
@@ -2216,6 +2476,26 @@ async function fetchCustomerLeads(email) {
     (listingRows || []).map((m) => [String(m.email || "").toLowerCase(), m])
   )
 
+  // Thread metadata (last message + unread-from-mover count) so the
+  // customer's Messages list can show a live preview, same as the mover
+  // dashboard does in GET /api/messages.
+  const leadIds = leadsRows.map((l) => l.id)
+  let lastByLead = {}
+  let unreadByLead = {}
+  if (leadIds.length) {
+    const { data: threadRows } = await supabase
+      .from("lead_messages")
+      .select("lead_id, sender_type, body, created_at, read_at")
+      .in("lead_id", leadIds)
+      .order("created_at", { ascending: true })
+    for (const m of threadRows || []) {
+      lastByLead[m.lead_id] = m
+      if (m.sender_type === "mover" && !m.read_at) {
+        unreadByLead[m.lead_id] = (unreadByLead[m.lead_id] || 0) + 1
+      }
+    }
+  }
+
   return leadsRows.map((l) => {
     const mover = profilesById[l.mover_id]
     const listing = mover?.email ? listingByEmail[String(mover.email).toLowerCase()] : null
@@ -2234,6 +2514,10 @@ async function fetchCustomerLeads(email) {
       notes: l.notes,
       sentStatus: l.sent_status,
       createdAt: l.created_at,
+      lastMessage: lastByLead[l.id]
+        ? { body: lastByLead[l.id].body, senderType: lastByLead[l.id].sender_type, createdAt: lastByLead[l.id].created_at }
+        : null,
+      unreadCount: unreadByLead[l.id] || 0,
     }
   })
 }
