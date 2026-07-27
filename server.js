@@ -1827,6 +1827,24 @@ app.post("/api/signup", async (req, res) => {
 
     const baseUrl = process.env.PUBLIC_URL || "https://packrocket.co"
 
+    // Welcome email — sent regardless of plan (Free or paid), since the
+    // account exists either way; billing/checkout happens after this.
+    try {
+      await resend.emails.send({
+        from: "PackRocket <noreply@packrocket.co>",
+        to: [normalizedEmail],
+        subject: "Welcome to PackRocket! 🚛",
+        text:
+          `Hi ${fullName || businessName || "there"},\n\n` +
+          `Thanks for signing up with PackRocket as a mover! Your account is ready.\n\n` +
+          `Log in any time to complete your profile, set your service area, and start getting move requests from customers near you:\n` +
+          `${baseUrl}/dashboard?email=${encodeURIComponent(normalizedEmail)}\n\n` +
+          `Welcome aboard!\n– The PackRocket Team`,
+      })
+    } catch (welcomeErr) {
+      console.error("Mover welcome email failed (non-fatal):", welcomeErr?.message)
+    }
+
     if (plan === "Free") {
       await supabase.from("profiles").update({ status: "active" }).eq("id", user.id)
 
@@ -2196,6 +2214,23 @@ app.post("/api/customer/signup", async (req, res) => {
     if (insertErr) {
       try { await supabase.auth.admin.deleteUser(user.id) } catch {}
       return res.status(400).json({ ok: false, code: "PROFILE_UPSERT_FAILED", error: "We couldn't finish setting up your account. Please try again." })
+    }
+
+    try {
+      const baseUrl = process.env.PUBLIC_URL || "https://packrocket.co"
+      await resend.emails.send({
+        from: "PackRocket <noreply@packrocket.co>",
+        to: [normalizedEmail],
+        subject: "Welcome to PackRocket! 🎉",
+        text:
+          `Hi ${fullName || "there"},\n\n` +
+          `Thanks for signing up with PackRocket! You're all set to search for movers, ` +
+          `message them directly, and keep track of your upcoming move.\n\n` +
+          `Head back to PackRocket any time to get started:\n${baseUrl}/results\n\n` +
+          `Welcome aboard!\n– The PackRocket Team`,
+      })
+    } catch (welcomeErr) {
+      console.error("Customer welcome email failed (non-fatal):", welcomeErr?.message)
     }
 
     return res.json({ ok: true, customer: mapCustomerToPublic(customerRow) })
