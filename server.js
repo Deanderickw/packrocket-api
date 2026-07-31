@@ -470,6 +470,85 @@ app.use(express.urlencoded({ extended: true }))
 
 app.get("/api/health", (_req, res) => res.json({ ok: true }))
 
+/* ==========================================================================
+   GLOBAL SEARCH COUNTER
+
+   One real number, stored in Supabase, that every visitor sees the same
+   value for — unlike localStorage, which is per-browser only.
+
+   Requires this table + function in Supabase (run once, in the SQL editor):
+
+   create table if not exists site_counters (
+     key text primary key,
+     value bigint not null default 0
+   );
+
+   insert into site_counters (key, value)
+   values ('search_count', 15000)
+   on conflict (key) do nothing;
+
+   create or replace function increment_search_count()
+   returns bigint as $$
+     update site_counters set value = value + 1 where key = 'search_count'
+     returning value;
+   $$ language sql volatile;
+
+   If you already ran this migration with a different seed value before,
+   update the existing row once with:
+     update site_counters set value = 15000 where key = 'search_count';
+   ========================================================================== */
+
+// Read the current count — called once when the search page loads.
+app.get("/api/search-count", async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("site_counters")
+      .select("value")
+      .eq("key", "search_count")
+      .maybeSingle()
+
+    if (error) {
+      console.error("/api/search-count GET error:", error)
+      return res.status(500).json({ ok: false, error: "Failed to fetch count" })
+    }
+
+    // First time this has ever run and the row doesn't exist yet —
+    // seed it so future reads/increments have something to work with.
+    if (!data) {
+      const seedValue = 15000
+      await supabase
+        .from("site_counters")
+        .upsert([{ key: "search_count", value: seedValue }])
+      return res.json({ ok: true, count: seedValue })
+    }
+
+    return res.json({ ok: true, count: data.value })
+  } catch (err) {
+    console.error("/api/search-count GET error:", err)
+    return res.status(500).json({ ok: false, error: "Server error" })
+  }
+})
+
+// Bump the count by 1 — called every time someone hits "Find movers".
+// Uses a Postgres function (increment_search_count) so concurrent
+// searches from different people don't clobber each other the way a
+// plain "read value, add 1, write value" would under load.
+app.post("/api/search-count/increment", async (req, res) => {
+  try {
+    const { data, error } = await supabase.rpc("increment_search_count")
+
+    if (error) {
+      console.error("increment_search_count RPC error:", error)
+      return res.status(500).json({ ok: false, error: "Failed to increment count" })
+    }
+
+    const count = typeof data === "number" ? data : data?.[0]?.increment_search_count
+    return res.json({ ok: true, count })
+  } catch (err) {
+    console.error("/api/search-count/increment error:", err)
+    return res.status(500).json({ ok: false, error: "Server error" })
+  }
+})
 
 /* ------------------------ Create Lead + Email Mover ------------------------ */
 
