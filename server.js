@@ -774,7 +774,7 @@ app.post("/api/leads/confirm-email", async (req, res) => {
 
     const baseUrl = process.env.PUBLIC_URL || "https://packrocket.co"
     const signupUrl =
-      `${baseUrl}/signup?email=${encodeURIComponent(normalizedEmail)}` +
+      `${baseUrl}/customer-signup?email=${encodeURIComponent(normalizedEmail)}` +
       (customerName ? `&name=${encodeURIComponent(customerName)}` : "")
 
     const signupBlockHtml = hasAccount
@@ -815,9 +815,11 @@ app.post("/api/leads/confirm-email", async (req, res) => {
           </tr>
           <tr>
             <td style="padding:24px 32px 0;text-align:center;">
-              <div style="width:64px;height:64px;border-radius:50%;background:#4CAF82;display:inline-flex;align-items:center;justify-content:center;">
-                <table role="presentation" cellpadding="0" cellspacing="0"><tr><td style="color:#ffffff;font-size:28px;line-height:64px;">✓</td></tr></table>
-              </div>
+              <table role="presentation" cellpadding="0" cellspacing="0" align="center" style="margin:0 auto;">
+                <tr>
+                  <td width="64" height="64" align="center" valign="middle" bgcolor="#4CAF82" style="width:64px;height:64px;border-radius:50%;background:#4CAF82;font-size:30px;line-height:64px;color:#ffffff;font-family:Arial,Helvetica,sans-serif;">&#10003;</td>
+                </tr>
+              </table>
             </td>
           </tr>
           <tr>
