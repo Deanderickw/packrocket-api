@@ -718,6 +718,171 @@ app.post("/api/leads", async (req, res) => {
   }
 })
 
+/* ------------------ Booking confirmation email (customer-facing) ------------------
+   Called by BookingForm.tsx right after a successful /api/leads submit.
+   Sends the customer a confirmation from "The PackRocket Team" saying their
+   request went out to the mover, and — if hasAccount is false — nudges them
+   to create a free account. This is intentionally best-effort: BookingForm
+   doesn't block or fail the booking if this route errors, so it stays
+   non-fatal here too (a failed confirmation email should never look like a
+   failed booking to the customer). */
+app.post("/api/leads/confirm-email", async (req, res) => {
+  try {
+    const {
+      moverId,
+      moverName: providedMoverName,
+      customerName,
+      customerEmail,
+      moveDate,
+      hasAccount,
+    } = req.body || {}
+
+    if (!customerEmail) {
+      return res.status(400).json({ ok: false, error: "Missing customerEmail" })
+    }
+
+    const normalizedEmail = normalizeEmail(customerEmail)
+    let moverName = providedMoverName || "your mover"
+
+    // Fall back to a real lookup if the caller didn't pass a name along —
+    // mirrors the profiles -> movers fallback used in /api/leads above.
+    if (!providedMoverName && moverId) {
+      const { data: moverProfile } = await supabase
+        .from("profiles")
+        .select("business_name, full_name")
+        .eq("id", moverId)
+        .maybeSingle()
+      if (moverProfile) {
+        moverName = moverProfile.business_name || moverProfile.full_name || moverName
+      } else {
+        const { data: moverRow } = await supabase
+          .from("movers")
+          .select("name")
+          .eq("id", moverId)
+          .maybeSingle()
+        if (moverRow?.name) moverName = moverRow.name
+      }
+    }
+
+    const moveDateLabel = moveDate
+      ? new Date(`${moveDate}T00:00:00`).toLocaleDateString("en-US", {
+          month: "long",
+          day: "numeric",
+          year: "numeric",
+        })
+      : "your move date"
+
+    const baseUrl = process.env.PUBLIC_URL || "https://packrocket.co"
+    const signupUrl =
+      `${baseUrl}/signup?email=${encodeURIComponent(normalizedEmail)}` +
+      (customerName ? `&name=${encodeURIComponent(customerName)}` : "")
+
+    const signupBlockHtml = hasAccount
+      ? ""
+      : `
+          <tr>
+            <td style="padding:20px 32px 0;">
+              <div style="border:1.5px solid #1F8052;background:#F0F9F4;border-radius:14px;padding:18px 20px;">
+                <div style="font-size:14px;font-weight:600;color:#111827;margin-bottom:6px;">
+                  Don't lose track of this request
+                </div>
+                <p style="margin:0 0 14px;font-size:13px;line-height:1.6;color:#4B5563;">
+                  You sent this as a guest. Create a free PackRocket account to see this
+                  request anytime, message your mover directly, and save movers for later.
+                  No credit card required.
+                </p>
+                <a href="${signupUrl}"
+                   style="display:inline-block;background:#1F8052;color:#ffffff;text-decoration:none;font-size:14px;font-weight:500;padding:12px 22px;border-radius:10px;">
+                  Create a free account
+                </a>
+              </div>
+            </td>
+          </tr>`
+
+    const html = `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8" /></head>
+<body style="margin:0;padding:0;background:#F7F8FA;font-family:-apple-system,BlinkMacSystemFont,Arial,sans-serif;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F7F8FA;padding:32px 0;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:520px;background:#ffffff;border-radius:20px;overflow:hidden;border:1px solid #E5E7EB;">
+          <tr>
+            <td style="padding:32px 32px 0;text-align:center;">
+              <div style="font-size:19px;font-weight:600;color:#1F8052;letter-spacing:-0.01em;">PackRocket</div>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:24px 32px 0;text-align:center;">
+              <div style="width:64px;height:64px;border-radius:50%;background:#4CAF82;display:inline-flex;align-items:center;justify-content:center;">
+                <table role="presentation" cellpadding="0" cellspacing="0"><tr><td style="color:#ffffff;font-size:28px;line-height:64px;">✓</td></tr></table>
+              </div>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:20px 32px 0;text-align:center;">
+              <h1 style="margin:0;font-size:21px;font-weight:600;color:#111827;">Your move request was sent!</h1>
+              <p style="margin:10px 0 0;font-size:15px;line-height:1.6;color:#6B7280;">
+                Hi ${customerName || "there"}, we sent your request to
+                <strong style="font-weight:600;color:#111827;">${moverName}</strong> for your move
+                on <strong style="font-weight:600;color:#111827;">${moveDateLabel}</strong>. They typically respond within a few hours.
+              </p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:28px 32px 0;">
+              <div style="border:1px solid #E5E7EB;border-radius:14px;padding:18px 20px;">
+                <div style="font-size:13px;font-weight:600;color:#111827;margin-bottom:10px;">What happens next</div>
+                <p style="margin:0;font-size:13.5px;line-height:1.7;color:#4B5563;">
+                  ${moverName} will review your request and reach out directly by phone or email
+                  to confirm availability and pricing. There's no payment required to send a request.
+                </p>
+              </div>
+            </td>
+          </tr>
+          ${signupBlockHtml}
+          <tr>
+            <td style="padding:28px 32px 32px;text-align:center;">
+              <p style="margin:0;font-size:12.5px;color:#9CA3AF;line-height:1.6;">
+                Thanks for using PackRocket to find your mover.<br />— The PackRocket Team
+              </p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`
+
+    const text =
+      `Hi ${customerName || "there"},\n\n` +
+      `Your move request was sent to ${moverName} for your move on ${moveDateLabel}. ` +
+      `They typically respond within a few hours.\n\n` +
+      `${moverName} will review your request and reach out directly by phone or email ` +
+      `to confirm availability and pricing. There's no payment required to send a request.\n\n` +
+      (hasAccount
+        ? ""
+        : `Since you sent this as a guest, create a free PackRocket account to keep track of ` +
+          `this request, message your mover, and save movers for later:\n${signupUrl}\n\n`) +
+      `– The PackRocket Team\nhttps://packrocket.co`
+
+    await resend.emails.send({
+      from: "PackRocket <noreply@packrocket.co>",
+      to: [normalizedEmail],
+      subject: `Your move request was sent to ${moverName}`,
+      text,
+      html,
+    })
+
+    return res.json({ ok: true })
+  } catch (err) {
+    console.error("/api/leads/confirm-email error:", err)
+    return res.status(500).json({ ok: false, error: "Server error" })
+  }
+})
+
 /* -------------------- Message a mover -------------------- */
 
 app.post("/api/message", async (req, res) => {
