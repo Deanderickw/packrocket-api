@@ -77,6 +77,32 @@ function formatDateLabel(isoOrMillis) {
 }
 
 /*
+  Turns whatever a mover set in their dashboard's "Response Time" field
+  (movers.response_time — same field the listing card and profile page
+  read via ["Response Time"]) into a "within ___" phrase that reads
+  naturally inside "They typically respond ___." Mirrors the shortRT()
+  parsing used on the frontend (PackRocketSearch.tsx /
+  PackRocketMoverProfile.tsx) so the email always reflects the mover's
+  actual configured response time instead of a hardcoded guess.
+*/
+function formatResponseTimePhrase(raw) {
+  const s = String(raw || "").trim()
+  if (!s) return "within a few hours"
+  const m = s.match(/within\s+(\d+)\s*min/i)
+  if (m) return `within ${m[1]} minutes`
+  if (/within\s+1\s*hour/i.test(s)) return "within about an hour"
+  if (/within\s+a\s+few\s+hours/i.test(s)) return "within a few hours"
+  if (/same\s*day/i.test(s)) return "the same day"
+  if (/within\s+24\s*hours/i.test(s)) return "within 24 hours"
+  const stripped = s.replace(/^typically\s+responds\s*/i, "").trim()
+  if (!stripped) return "within a few hours"
+  const lower = stripped.toLowerCase()
+  return lower.startsWith("within") || lower.startsWith("same") || lower.startsWith("in ")
+    ? stripped
+    : `within ${stripped}`
+}
+
+/*
   Crew type helpers — controls the "Crew Included" box on the listing card.
   Stored in movers.crew_type as either "truck" or "labor_only".
   Defaults to "truck" (Crew Included / Truck & equipment provided) when unset.
@@ -764,6 +790,44 @@ app.post("/api/leads/confirm-email", async (req, res) => {
       }
     }
 
+    // Pull the mover's actual configured response time from the movers
+    // table (the public listing row — same field the search results and
+    // profile page display), rather than assuming "a few hours" for
+    // everyone. moverId here is the profiles.id; the movers table is a
+    // separate listing row kept in sync by email, so we try a direct id
+    // match first (covers movers rows keyed the same way) and fall back
+    // to looking it up by the profile's email.
+    let responseTimeRaw = ""
+    try {
+      const { data: moverListingById } = await supabase
+        .from("movers")
+        .select("response_time")
+        .eq("id", moverId)
+        .maybeSingle()
+      if (moverListingById?.response_time) {
+        responseTimeRaw = moverListingById.response_time
+      } else {
+        const { data: moverProfileForEmail } = await supabase
+          .from("profiles")
+          .select("email")
+          .eq("id", moverId)
+          .maybeSingle()
+        if (moverProfileForEmail?.email) {
+          const { data: moverListingByEmail } = await supabase
+            .from("movers")
+            .select("response_time")
+            .ilike("email", moverProfileForEmail.email)
+            .maybeSingle()
+          if (moverListingByEmail?.response_time) {
+            responseTimeRaw = moverListingByEmail.response_time
+          }
+        }
+      }
+    } catch (rtErr) {
+      console.error("confirm-email response_time lookup failed (non-fatal):", rtErr?.message)
+    }
+    const responseTimePhrase = formatResponseTimePhrase(responseTimeRaw)
+
     const moveDateLabel = moveDate
       ? new Date(`${moveDate}T00:00:00`).toLocaleDateString("en-US", {
           month: "long",
@@ -828,7 +892,7 @@ app.post("/api/leads/confirm-email", async (req, res) => {
               <p style="margin:10px 0 0;font-size:15px;line-height:1.6;color:#6B7280;">
                 Hi ${customerName || "there"}, we sent your request to
                 <strong style="font-weight:600;color:#111827;">${moverName}</strong> for your move
-                on <strong style="font-weight:600;color:#111827;">${moveDateLabel}</strong>. They typically respond within a few hours.
+                on <strong style="font-weight:600;color:#111827;">${moveDateLabel}</strong>. They typically respond ${responseTimePhrase}.
               </p>
             </td>
           </tr>
@@ -861,7 +925,7 @@ app.post("/api/leads/confirm-email", async (req, res) => {
     const text =
       `Hi ${customerName || "there"},\n\n` +
       `Your move request was sent to ${moverName} for your move on ${moveDateLabel}. ` +
-      `They typically respond within a few hours.\n\n` +
+      `They typically respond ${responseTimePhrase}.\n\n` +
       `${moverName} will review your request and reach out directly by phone or email ` +
       `to confirm availability and pricing. There's no payment required to send a request.\n\n` +
       (hasAccount
